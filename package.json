@@ -1,0 +1,39 @@
+{
+  "name": "douyin-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "抖音固定账号新作品监测 / 视频与文案采集 / OSS 交接给下游转录翻译管线",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "serve": "tsx src/cli.ts serve",
+    "once": "tsx src/cli.ts once",
+    "status": "tsx src/cli.ts status",
+    "retry-failed": "tsx src/cli.ts retry-failed",
+    "inspect-openapi": "tsx scripts/inspect-openapi.ts",
+    "dtk:bootstrap": "tsx scripts/bootstrap.ts",
+    "demo": "tsx scripts/demo.ts",
+    "mock-dtk": "tsx scripts/mock-dtk.ts",
+    "dtk:up": "bash scripts/dtk.sh up",
+    "dtk:pull": "bash scripts/dtk.sh pull",
+    "dtk:status": "bash scripts/dtk.sh status",
+    "dtk:logs": "bash scripts/dtk.sh logs",
+    "test": "tsx --test test/*.test.ts",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ali-oss": "^6.23.0",
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^17.2.2",
+    "p-limit": "^7.3.3",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.18.6",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

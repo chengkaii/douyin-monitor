@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+!.env.example
+accounts.yaml
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.log
+.DS_Store
+coverage/
+dist/

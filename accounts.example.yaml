@@ -1,0 +1,27 @@
+# 监测账号清单（复制为 accounts.yaml 后填写真实 sec_user_id）
+# sec_user_id 获取：抖音 App → 账号主页 → 分享 → 复制链接 → 浏览器打开后的 /user/MS4wLjABAAAA...
+accounts:
+  - name: "示例账号A"
+    sec_user_id: "MS4wLjABAAAA_REPLACE_ME"
+    enabled: false
+
+polling:
+  intervalMinutes: 5        # 每账号轮询周期
+  jitterSeconds: 120        # 错峰随机抖动上限
+  minGapSeconds: 8          # 两次请求最小间隔，保护容器身份池
+  nightIntervalMinutes: 15  # 夜间放宽周期
+  nightStartHour: 0
+  nightEndHour: 6
+
+download:
+  concurrency: 2
+  maxRetries: 3
+  minBytes: 1048576         # 小于 1MB 视为损坏
+  retryDelaysMs: [30000, 120000, 600000]
+
+retry:
+  maxAttempts: 5        # 单条视频跨轮最多处理次数（1 次首发 + 4 次自动重投）
+  everyRounds: 20       # serve 每 20 轮（15s/轮 ≈ 5 分钟）扫一次 failed
+
+oss:
+  prefix: "douyin-monitor/"

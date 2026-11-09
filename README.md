@@ -43,6 +43,16 @@ data/demo/outbox/douyin-monitor/MS4wLjAB/202611/
 
 ## 3. 正式部署
 
+> **从 GitHub clone 到新机器（含 Linux 服务器）时**，仓库不含 `.env` / `accounts.yaml` / `data/`，先做一次初始化：
+>
+> ```bash
+> cp .env.example .env                 # DTK 接口路径已按 v5.1.7 填好，只需补 DTK_API_KEY / OSS_*
+> cp accounts.example.yaml accounts.yaml
+> npm install                          # better-sqlite3 是原生模块，必须在目标机重新编译，别直接拷 node_modules
+> ```
+>
+> 官方 DTK 源码是第三方仓库，未纳入本项目，需单独放到同级 `douyin-api/`（见 §3.1）。远端推荐用 SSH：`git clone git@github.com:chengkaii/douyin-monitor.git`。
+
 ### 3.1 起 DTK v5 容器栈（首次需你在自己终端操作一次）
 
 > ⚠️ **平台说明**：以下为 macOS 步骤。Linux 服务器请用 Docker CE + `/etc/docker/daemon.json` 配镜像源，并把 §5 的 launchd 换成 systemd unit（适配待做）。DTK 容器本身与 Node 调度器在 Linux 上运行无差异。
@@ -66,7 +76,7 @@ data/demo/outbox/douyin-monitor/MS4wLjAB/202611/
 
 > 不配镜像源会卡在拉镜像：`auth.docker.io` / `registry-1.docker.io` 当前不可达，上面几个镜像站实测可达。
 
-官方仓库已在 `../douyin-api/`（源码 tarball），`.env`（随机密钥 + 官方发布镜像）已生成。之后三步：
+官方 DTK 源码**未纳入本仓库**：把它 clone 到同级 `douyin-api/`，或用 `DTK_REPO=/path/to/repo` 指定；并在该目录生成 `.env`（`DTK_SECRET_KEY` / `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `DTK_DATABASE_URL` / `DTK_REDIS_URL` / `DTK_IMAGE=evil0ctal/douyin_tiktok_download_api`）。之后三步：
 
 ```bash
 npm run dtk:up         # 拉发布镜像 + 起 api/worker/postgres/redis（--no-build）
@@ -95,7 +105,7 @@ npm run dtk:bootstrap  # 自动建管理员 → 登录 → 生成 douyin:read �
 
 ### 3.3 填账号与凭据
 
-`accounts.yaml` 与 `.env` **已生成**（空账号清单 + 真实接口路径 + 填写说明），直接编辑即可：
+`.env` 与 `accounts.yaml` 含凭据，**不入库**；从 GitHub clone 的全新环境先按 §3 开头复制模板再编辑：
 
 ```bash
 # 填入每个账号的 sec_user_id（抖音 App → 主页 → 分享 → 复制链接 → 浏览器重定向后的 /user/MS4w...）

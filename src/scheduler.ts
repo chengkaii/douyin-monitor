@@ -18,12 +18,27 @@ export function backoffMs(baseMs: number, failStreak: number): number {
   return Math.min(baseMs * 2 ** Math.min(failStreak, 12), MAX_BACKOFF_MS);
 }
 
+/** 按指定时区取小时。Linux 服务器多跑 UTC，直接用 getHours() 会把北京时间夜间错判成白天 */
+export function hourInTimeZone(date: Date, timeZone: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hour: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date);
+    const hour = Number(parts.find((p) => p.type === 'hour')?.value);
+    return Number.isFinite(hour) ? hour : date.getHours();
+  } catch {
+    return date.getHours(); // 时区名非法时退回本地时间，行为可预期
+  }
+}
+
 export function nextPollDelayMs(
   polling: PollingConfig,
   failStreak: number,
   now = new Date(),
 ): number {
-  const night = isNight(now.getHours(), polling.nightStartHour, polling.nightEndHour);
+  const night = isNight(hourInTimeZone(now, polling.timeZone), polling.nightStartHour, polling.nightEndHour);
   const minutes = night ? polling.nightIntervalMinutes : polling.intervalMinutes;
   const base = Math.max(1, minutes) * MINUTE_MS;
   const jitter = Math.floor(Math.random() * Math.max(0, polling.jitterSeconds) * 1000);

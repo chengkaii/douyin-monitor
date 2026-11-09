@@ -1,0 +1,27 @@
+[Unit]
+Description=douyin-monitor 抖音账号监测调度器
+Documentation=https://github.com/chengkaii/douyin-monitor
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+Environment=TZ=__TZ__
+Environment=NODE_ENV=production
+Environment=PATH=__NODE_DIR__:/usr/local/bin:/usr/bin:/bin
+ExecStart=__NODE_BIN__ __PROJECT_DIR__/node_modules/tsx/dist/cli.mjs __PROJECT_DIR__/src/cli.ts serve
+
+# 崩溃/重启自愈；状态在 SQLite，重启后自动恢复 downloading 行、重投未达上限的 failed 行
+Restart=always
+RestartSec=10
+
+# 日志交给 journald（自带轮转），不再写固定文件
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=douyin-monitor
+
+[Install]
+WantedBy=multi-user.target

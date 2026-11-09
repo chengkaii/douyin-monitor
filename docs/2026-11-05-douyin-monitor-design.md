@@ -1,12 +1,12 @@
 # 抖音账号监测与视频采集系统 — 技术实现文档
 
-- **日期**：2026-11-05（2026-11-06 修订：对齐 DTK v5）
-- **状态**：设计定稿；代码骨架已落地（见 `douyin-monitor/`），真实容器联调待 M1
+- **日期**：2026-11-05（2026-11-06 修订：对齐 DTK v5；2026-11-09 修订：部署目标改为 Linux 服务器）
+- **状态**：设计定稿 + 代码已落地（见 `douyin-monitor/`），真实容器联调待 M1；代码已推送私有 GitHub 仓库 `chengkaii/douyin-monitor`
 - **负责人**：凯哥
 - **关联项目**：下游转录/翻译再创作管线（云端）、ffyc-creator OSS
 - **实现代码**：[`README.md`](../README.md)
 
-> 实现状态速览：`tsc --noEmit` 0 错误、32 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI 与 launchd 模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**未完成**：真实 DTK 容器联调（本机无 Docker）、`DTK_POSTS_PATH` 等路径需 `npm run inspect-openapi` 实测填写、真实账号与 OSS 凭据未提供、云端回调（二期）、review 第二批 🟡 项。
+> 实现状态速览：`tsc --noEmit` 0 错误、36 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、review 第二批 🟡 项。
 
 ---
 
@@ -17,14 +17,14 @@
 | 用途   | 视频本体 + 文案下载后交给云端转录/翻译程序再创作                               |
 | 监测规模 | 20+ 固定账号，分钟级发现新作品                                        |
 | 获取通道 | 自建爬虫（免费），Docker 自部署 Evil0ctal/Douyin_TikTok_Download_API |
-| 部署位置 | 本地 Mac 常驻采集，云端处理                                         |
+| 部署位置 | Linux 服务器常驻采集（Docker CE + systemd），云端处理                  |
 | 数据交接 | 上传 ffyc-creator OSS，云端程序消费                               |
 | 工程形态 | 开源 API 容器 + 自研 Node.js 调度器                               |
 
 ## 2. 总体架构
 
 ```
-┌────────────────────── Mac (本地) ──────────────────────┐
+┌─────────────────── Linux 服务器 ───────────────────────┐
 │                                                         │
 │  ┌─────────────────────┐    ┌────────────────────────┐ │
 │  │ douyin-api           │◄──│  monitor 调度器          │ │
@@ -46,6 +46,8 @@
                                 │ （消费 OSS 新文件）   │
                                 └─────────────────────┘
 ```
+
+> **出口 IP**：服务器是机房 IP，调度器把 `DTK_PROXY_URL`（住宅代理完整 URL）作为 `?proxy=` 传给 DTK，由 DTK 内部 `wreq.Proxy` 用于「DTK → 抖音」的上游请求。本机 `127.0.0.1:8000` 这段、OSS 上传、以及视频 CDN 下载均直连——CDN 是静态资源，不构成风控面，也不该消耗住宅代理流量。
 
 **核心设计原则**：
 
@@ -243,28 +245,34 @@ douyin-monitor/
 | 单账号风控（滑块/空数据）  | 该账号 `fail_streak` 累计            | 指数退避：下次轮询时间 = now + min(间隔 × 2^n, 24h)；连续 24h 失败告警   |
 | 视频下载中断/损坏      | 大小校验、Content-Type 校验、ffprobe 可选 | 重试 3 次（间隔 30s/2m/10m），仍失败置 `failed` 并告警，不阻塞队列        |
 | OSS 上传失败       | SDK 抛错                          | 重试 3 次；本地文件保留不删，下次启动扫 `downloaded` 状态补传              |
-| Mac 重启/进程崩溃    | —                               | launchd `KeepAlive` 自动拉起；所有任务状态落 SQLite，重启后从断点恢复     |
+| 服务器重启/进程崩溃   | —                               | systemd `Restart=always` 自动拉起；所有任务状态落 SQLite，重启后从断点恢复  |
 | 视频发布后列表延迟可见    | 常见现象                            | 无需处理，下次轮询自然补上；5 分钟周期可接受                              |
 
 **风控减压设计**：
 
 - 20+ 账号统一周期但请求间隔 ≥ 8s（单轮询周期内串行+错峰 jitter），折合单容器 QPS < 0.15；
-- 住宅 IP（Mac 本机出口）天然比机房 IP 风险低；
+- **机房 IP 必须用住宅代理兜住**：`DTK_PROXY_URL` 经 DTK 的 `?proxy=` 把上游请求换成住宅出口；DTK 默认 `security.request_proxy=deny`，`dtk:bootstrap` 在配置代理时自动开到 `public`（只允许公网可路由地址，不开 `any`）。不用代理时应在 console 改回 `deny` 收窄 SSRF 面；
 - 只拉列表首页，不做深翻页扫库；
-- 夜间（0:00–6:00）轮询周期放宽到 15 分钟，进一步降低行为规律性；
+- 夜间（北京时间 0:00–6:00）轮询周期放宽到 15 分钟，进一步降低行为规律性；时区由 `POLLING_TIMEZONE` / `polling.timeZone` 显式指定，不依赖服务器本地时区（多数云主机为 UTC）；
 - v5 自带自愈身份池、令牌桶、端点熔断，我们这层只做"账号级退避 + 全局错峰"，不重复造限速轮子。
 
 ## 7. 部署与运维
 
-### 7.1 常驻方式（macOS）
+### 7.1 常驻方式（Linux / systemd，主部署形态）
 
-`~/Library/LaunchAgents/com.starpp.douyin-monitor.plist`：
+`deploy/douyin-monitor.service.template` 由 `sudo ./deploy/install-service.sh` 渲染到 `/etc/systemd/system/douyin-monitor.service`：
 
-- `KeepAlive: true` — 崩溃自动重启
-- `RunAtLoad: true` — 开机自启
-- 日志重定向到 `data/logs/`，按天滚动（rotating file stream）
+- `Restart=always` + `RestartSec=10` — 崩溃自动重启
+- `After=network-online.target docker.service` / `Requires=docker.service` — 容器就绪后再启动
+- `systemctl enable --now` — 开机自启
+- 日志走 journald（`journalctl -u douyin-monitor -f`），自带轮转，不再写固定文件
+- 建议专用运行用户（如 `deploy`）；脚本会把 `data/` 属主改过去、`.env` 权限收为 600
 
-容器栈由 `docker compose -p dtk -f docker/compose.yml up -d` 启动（api + worker + postgres + redis），Docker Desktop 设置为开机启动。首次启动用 `logs api` 中的 setup token 建管理员，并在 console 生成带 scopes 的 API key 写入调度器 `.env`。
+容器栈由 `npm run dtk:up`（等价 `docker compose -p dtk -f docker/compose.yml up -d --no-build --wait`）启动，compose 里 api/worker/postgres/redis 均为 `restart: unless-stopped`，Docker 由 `systemctl enable --now docker` 保证开机自启。`npm run dtk:bootstrap` 全程 HTTP 建管理员、发 `douyin:read` API key 并写回 `.env`，无需打开浏览器控制台。
+
+`scripts/setup-runtime.sh` 负责运行时就绪：Linux 分支按发行版装 Docker CE + compose plugin（阿里云源）、合并 `/etc/docker/daemon.json` 的 registry-mirrors、校验 Node ≥ 20；macOS 分支仍走 Docker Desktop。DTK 的 api 只绑 `127.0.0.1:8000`，服务器无需开放防火墙端口。
+
+> **只允许一个写进程**：服务运行期间不要手动跑 `once` / `retry-failed`；`status` 只读，随时可查。
 
 **关于"要不要一直开着浏览器"**：不需要。采集链路是纯后台 HTTP 请求（v5 用 `wreq` 模拟浏览器 TLS 指纹 + 纯 Python 生成签名），不是 Selenium 式挂着一个抖音网页。三种"浏览器"概念要分清：
 
@@ -274,9 +282,13 @@ douyin-monitor/
 | Docker 内 `--profile browser` 无头容器 | ✅ 后台常驻（无界面） | CloakBrowser / browser-rpc，身份池可用身份不足时自动铸造游客身份、签名兜底；只被 HTTP 按需调用，不占屏幕、不需人工操作 |
 | 真机登录态 | 视选择 | 只有选择"不启 browser profile + 手动导入 Cookie"时才需要定期维护 |
 
-**真正需要一直运行的**：Docker Desktop（后台）、Node 调度器（launchd 拉起）、以及 Mac 保持不休眠（`caffeinate` 或系统设置「防止自动睡眠」）。合盖休眠会中断采集，这比"开不开浏览器"更值得关注。
+**真正需要一直运行的**：Docker daemon（systemd 托管）+ Node 调度器（systemd `Restart=always`）。服务器不休眠，无需 `caffeinate`。unit 设 `TZ=Asia/Shanghai`，夜间窗口另由 `POLLING_TIMEZONE` 显式控制，两者都不依赖云主机默认的 UTC。
 
-推荐 `--profile browser`：省掉 Cookie 定期维护，代价是多一个 headless Chromium 容器（额外几百 MB 内存）。20+ 账号分钟级的场景，用手动 Cookie 保活得不偿失。
+推荐 `--profile browser`：省掉 Cookie 定期维护，代价是多一个 headless Chromium 容器（额外几百 MB 内存，compose 里已限 4g）。20+ 账号分钟级的场景，用手动 Cookie 保活得不偿失。
+
+#### macOS 本地调试（可选）
+
+`deploy/com.starpp.douyin-monitor.plist.template` 是 launchd 模板（`KeepAlive` + `RunAtLoad`），`launchctl load` 后常驻；还需 `caffeinate -s &` 防合盖休眠。生产部署不用这套。
 
 ### 7.2 告警通道（notify.ts）
 
@@ -307,19 +319,22 @@ douyin-monitor/
 | M1 | 容器跑通 + 从实例 `/openapi.json` 确认用户作品列表/单视频解析的真实路径与参数 + Channel 封装（含 202/task_id 或 `?wait=` 处理） | 能打印某账号最新 20 条作品的 video_id 与文案 |
 | M2 | SQLite 增量 + 轮询调度 + 下载落盘      | 单账号自动发现新视频并下载成功               |
 | M3 | manifest + OSS 上传 + 状态闭环     | OSS 出现 mp4+json 配对，本地临时文件清理   |
-| M4 | 告警 + launchd 常驻 + status 命令  | 重启自愈、失败可观测                    |
+| M4 | 告警 + systemd 常驻 + status 命令 | 重启自愈、失败可观测                    |
 | M5 | 2 账号试运行 3 天 → 扩到全量           | 漏检率 ≈ 0、无风控告警                 |
 
 ## 10. 风险与开放问题
 
 | 风险                      | 等级   | 缓解                                               |
 | ----------------------- | ---- | ------------------------------------------------ |
+| **机房 IP 被抖音风控识别**     | 🔴 高 | 必配住宅代理 `DTK_PROXY_URL`，经 DTK `?proxy=` 由 `wreq.Proxy` 换出口；上线前用 2 账号 / 30 分钟周期试跑 3 天，观察 4xx 与合法空列表比例，异常即降频或换代理 |
+| 代理凭据出现在请求 URL 中        | 🟡 中 | DTK 只绑 `127.0.0.1:8000`、API key 私有；本项目错误信息只打 pathname 不打完整 URL；DTK 侧对代理 URL 有脱敏日志；勿外泄容器访问日志 |
+| 云主机默认 UTC 导致夜间窗口错判    | 🟡 中 | `POLLING_TIMEZONE` / `polling.timeZone` 显式指定 `Asia/Shanghai`，代码用 `Intl.DateTimeFormat` 取小时，不依赖 `getHours()` |
 | 开源项目签名更新滞后于抖音风控（数天级不可用） | 🟡 中 | 通道抽象已预留 TikHub 切换位；付费按量计费，应急成本低                  |
 | 游客身份自动生成（guest identity） | 🟡 中 | v5 默认不启浏览器容器，抖音/TikTok 身份只能"导入"；要么加 `--profile browser` 让身份池自动铸造，要么导入自有登录 Cookie（有账号风险），M1 实测确认 |
-| v5 接口形态与预期不符（异步/路径/参数） | 🟡 中 | 以实例 `/openapi.json` 为唯一事实来源，M1 先固化 fixture 再写 Channel；不在 README 里猜路径 |
-| 抖音接口字段变更导致 manifest 断裂  | 🟢 低 | 字段归一化集中在 metadata.ts 一处，变更只改一个文件                 |
+| v5 接口形态与预期不符（异步/路径/参数） | 🟡 中 | 路径、鉴权头、cursor 语义已按 v5.1.7 源码逐条确认；实例版本不同时以 `/openapi.json` 为准并跑 `inspect-openapi` 核对 |
+| 抖音接口字段变更导致 manifest 断裂  | 🟢 低 | 字段归一化集中在 normalize.ts / metadata.ts，变更只改这两处            |
 | 合规                      | 🟡 中 | 下载内容用于内部再创作处理；控制请求频率、不二次分发原始视频；账号如有维权声明则从清单移除    |
-| Mac 合盖休眠导致采集停止          | 🟡 中 | `caffeinate` 防睡眠 或 系统设置「防止自动睡眠」；笔记本形态长期可迁云服务器+代理 |
+| 服务器重启 / 容器栈未就绪        | 🟢 低 | systemd `Restart=always` + 容器 `restart: unless-stopped`；状态全在 SQLite，重启自动恢复 |
 
 ---
 

@@ -1,65 +1,175 @@
 #!/usr/bin/env bash
-# 在「你自己的终端」里运行：首次安装 Docker Desktop 需要 GUI 授权，Agent 无法代劳。
-# 用法: ./scripts/setup-runtime.sh
+# 首次部署：准备容器运行时与镜像源。Linux 走 Docker CE + systemd；macOS 走 Docker Desktop。
+#
+#   Linux:  sudo ./scripts/setup-runtime.sh
+#   macOS:       ./scripts/setup-runtime.sh   （GUI 授权需人工点一次）
+#
+# 只负责「运行时就绪」，不启动业务容器、不装业务服务，后续步骤见 README §3。
 set -euo pipefail
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64) DMG_URL="https://desktop.docker.com/mac/stable/amd64/Docker.dmg" ;;
-  arm64)  DMG_URL="https://desktop.docker.com/mac/stable/arm64/Docker.dmg" ;;
-  *) echo "未知架构 $ARCH" >&2; exit 1 ;;
-esac
+MIRRORS_JSON='["https://docker.m.daocloud.io","https://docker.1ms.run","https://docker.xuanyuan.me","https://hub.rat.dev"]'
 
-echo "=== 1/3 检查 Docker ==="
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  echo "✅ Docker 已就绪：$(docker --version)"
-else
-  DMG="$HOME/Downloads/Docker.dmg"
-  echo "未检测到运行中的 Docker，开始安装（架构 $ARCH）"
-  if [[ ! -s "$DMG" ]]; then
-    echo "下载安装包到 $DMG ..."
-    if ! curl -fL --http1.1 --retry 3 --max-time 1800 -o "$DMG" "$DMG_URL"; then
-      echo "" >&2
-      echo "自动下载失败（网络代理限制）。请手动下载后放到 $DMG 再重跑本脚本：" >&2
-      echo "  $DMG_URL" >&2
-      echo "或用浏览器打开 https://www.docker.com/products/docker-desktop/ 下载 Intel/Apple 对应版本。" >&2
-      exit 1
-    fi
+need_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; else
+    command -v sudo >/dev/null 2>&1 || { echo "需要 root 或 sudo 权限" >&2; exit 1; }
+    SUDO="sudo"
   fi
-  echo "挂载并安装到 /Applications ..."
-  MNT="$(mktemp -d /tmp/docker-dmg.XXXXXX)"
-  hdiutil attach "$DMG" -nobrowse -mountpoint "$MNT" >/dev/null
-  cp -R "$MNT/Docker.app" /Applications/
-  hdiutil detach "$MNT" >/dev/null
-  open -a Docker
+}
+
+check_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "❌ 未检测到 Node.js（本项目要求 >= 20）。请先安装：" >&2
+    echo "   curl -fsSL https://fnm.vercel.app/install | bash && fnm install 22" >&2
+    echo "   或参考 https://nodejs.org/ 的官方二进制包" >&2
+    exit 1
+  fi
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]')"
+  if [[ "$major" -lt 20 ]]; then
+    echo "❌ Node.js 版本过低：$(node -v)，需要 >= 20" >&2
+    exit 1
+  fi
+  echo "✅ Node.js $(node -v) | npm $(npm -v)"
+}
+
+# 合并 registry-mirrors 到现有 daemon.json，保留用户其它配置
+write_daemon_json() {
+  local path="/etc/docker/daemon.json" existing tmp
+  existing="$(mktemp)"
+  tmp="$(mktemp)"
+  $SUDO mkdir -p /etc/docker
+  $SUDO cat "$path" > "$existing" 2>/dev/null || true
+  if ! EXISTING_FILE="$existing" MIRRORS="$MIRRORS_JSON" node -e '
+    const fs = require("fs");
+    let cfg = {};
+    try { cfg = JSON.parse(fs.readFileSync(process.env.EXISTING_FILE, "utf8")); } catch { /* 不存在或非法 */ }
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) cfg = {};
+    const mirrors = JSON.parse(process.env.MIRRORS);
+    const current = Array.isArray(cfg["registry-mirrors"]) ? cfg["registry-mirrors"] : [];
+    cfg["registry-mirrors"] = Array.from(new Set([...current, ...mirrors]));
+    process.stdout.write(JSON.stringify(cfg, null, 2) + "\n");
+  ' > "$tmp"; then
+    echo "❌ 生成 daemon.json 失败，请手动加入 registry-mirrors：$MIRRORS_JSON" >&2
+    rm -f "$existing" "$tmp"
+    exit 1
+  fi
+  $SUDO cp "$tmp" "$path"
+  rm -f "$existing" "$tmp"
+  echo "✅ 已写入 $path（保留原有配置，仅合并 registry-mirrors）"
+}
+
+install_docker_linux() {
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local distro="${ID:-unknown}"
+  echo "检测到发行版：$distro ${VERSION_ID:-}"
+  case "$distro" in
+    ubuntu|debian)
+      $SUDO apt-get update -qq
+      $SUDO apt-get install -y -qq ca-certificates curl gnupg
+      $SUDO install -m 0755 -d /etc/apt/keyrings
+      if [[ ! -s /etc/apt/keyrings/docker.gpg ]]; then
+        curl -fsSL --http1.1 "https://mirrors.aliyun.com/docker-ce/linux/${distro}/gpg" \
+          | $SUDO gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+      fi
+      $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/${distro} ${VERSION_CODENAME} stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+      $SUDO apt-get update -qq
+      $SUDO apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+      ;;
+    centos|rhel|rocky|almalinux|fedora)
+      $SUDO yum install -y -q yum-utils
+      $SUDO yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+      $SUDO yum install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin
+      ;;
+    *)
+      echo "❌ 未适配发行版 $distro。请按官方文档安装 Docker CE + compose plugin 后重跑本脚本：" >&2
+      echo "   https://docs.docker.com/engine/install/" >&2
+      exit 1
+      ;;
+  esac
+}
+
+setup_linux() {
+  need_root
+  echo "=== 1/4 检查 Node.js ==="
+  check_node
+
   echo ""
-  echo "⚠️  已拉起 Docker Desktop。请在弹窗里点「允许 / OK」完成系统授权，"
-  echo "    等菜单栏鲸鱼图标不再动画（约 1-2 分钟），然后重新运行本脚本。"
-  exit 0
-fi
+  echo "=== 2/4 检查 Docker CE + compose plugin ==="
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    echo "✅ Docker 已就绪：$(docker --version) / $(docker compose version)"
+  else
+    install_docker_linux
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable --now docker
+    echo "✅ Docker 已安装并设置为开机自启"
+  fi
 
-echo ""
-echo "=== 2/3 配置 Docker Hub 镜像加速（重要）==="
-echo "当前网络直连 auth.docker.io / registry-1.docker.io 不通，必须配镜像源。"
-echo "Docker Desktop → Settings（齿轮）→ Docker Engine，把右侧 JSON 改成："
-echo ""
-echo '{'
-echo '  "registry-mirrors": ['
-echo '    "https://docker.m.daocloud.io",'
-echo '    "https://docker.1ms.run",'
-echo '    "https://docker.xuanyuan.me",'
-echo '    "https://hub.rat.dev"'
-echo '  ]'
-echo '}'
-echo ""
-echo "（若原有其它配置，只把 registry-mirrors 这一项合并进去）然后点 Apply & Restart。"
-echo ""
-echo "验证镜像源可用："
-echo "  docker pull redis:8-alpine"
-echo ""
+  echo ""
+  echo "=== 3/4 配置 Docker Hub 镜像加速 ==="
+  write_daemon_json
+  $SUDO systemctl restart docker
+  for _ in 1 2 3 4 5; do docker info >/dev/null 2>&1 && break; sleep 2; done
+  docker info >/dev/null 2>&1 || { echo "❌ Docker 重启后未就绪，检查 journalctl -u docker" >&2; exit 1; }
+  echo "✅ Docker 已重启并就绪"
 
-echo "=== 3/3 启动 DTK 栈 ==="
-echo "  npm run dtk:up        # 拉发布镜像并起 api/worker/postgres/redis"
-echo "  npm run dtk:status    # 等全部 healthy"
-echo "  npm run dtk:bootstrap # 自动建管理员 + 生成 API key 写回 .env"
-echo ""
+  echo ""
+  echo "=== 4/4 收尾 ==="
+  echo "容器运行时准备完成。接下来（README §3）："
+  echo "  cp .env.example .env && cp accounts.example.yaml accounts.yaml"
+  echo "  npm install                 # better-sqlite3 需在目标机重新编译"
+  echo "  # 官方 DTK 源码放到同级 douyin-api/，或设置 DTK_REPO=/path/to/repo"
+  echo "  npm run dtk:up && npm run dtk:bootstrap"
+  echo "  sudo ./deploy/install-service.sh"
+  echo ""
+  echo "注意：DTK 的 api 容器只绑 127.0.0.1:8000，无需开放防火墙端口。"
+}
+
+setup_macos() {
+  echo "=== 1/3 检查 Node.js ==="
+  check_node
+
+  echo ""
+  echo "=== 2/3 检查 Docker Desktop ==="
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "✅ Docker 已就绪：$(docker --version)"
+  else
+    local arch dmg_url dmg mnt
+    arch="$(uname -m)"
+    case "$arch" in
+      x86_64) dmg_url="https://desktop.docker.com/mac/stable/amd64/Docker.dmg" ;;
+      arm64)  dmg_url="https://desktop.docker.com/mac/stable/arm64/Docker.dmg" ;;
+      *) echo "未知架构 $arch" >&2; exit 1 ;;
+    esac
+    dmg="$HOME/Downloads/Docker.dmg"
+    echo "未检测到运行中的 Docker，开始安装（架构 $arch）"
+    if [[ ! -s "$dmg" ]]; then
+      curl -fL --http1.1 --retry 3 --max-time 1800 -o "$dmg" "$dmg_url" || {
+        echo "自动下载失败。请手动下载后放到 $dmg 再重跑，或浏览器打开 https://www.docker.com/products/docker-desktop/" >&2
+        exit 1
+      }
+    fi
+    mnt="$(mktemp -d /tmp/docker-dmg.XXXXXX)"
+    hdiutil attach "$dmg" -nobrowse -mountpoint "$mnt" >/dev/null
+    cp -R "$mnt/Docker.app" /Applications/
+    hdiutil detach "$mnt" >/dev/null
+    open -a Docker
+    echo "⚠️  已拉起 Docker Desktop，请在弹窗完成系统授权，等鲸鱼图标静止后重跑本脚本。"
+    exit 0
+  fi
+
+  echo ""
+  echo "=== 3/3 配置镜像加速 ==="
+  echo "Docker Desktop → Settings → Docker Engine，把 registry-mirrors 合并进去并 Apply & Restart："
+  echo "$MIRRORS_JSON"
+  echo ""
+  echo "然后：npm run dtk:up && npm run dtk:bootstrap"
+}
+
+case "$(uname -s)" in
+  Linux) setup_linux ;;
+  Darwin) setup_macos ;;
+  *) echo "不支持的操作系统：$(uname -s)" >&2; exit 1 ;;
+esac

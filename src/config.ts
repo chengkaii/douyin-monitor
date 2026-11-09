@@ -35,6 +35,7 @@ const POLLING_DEFAULTS: PollingConfig = {
   nightIntervalMinutes: 15,
   nightStartHour: 0,
   nightEndHour: 6,
+  timeZone: 'Asia/Shanghai',
 };
 
 const DOWNLOAD_DEFAULTS: DownloadConfig = {
@@ -87,6 +88,7 @@ export function loadConfig(options: { requireAccountsFile?: boolean } = {}): App
     nightIntervalMinutes: num(pollingRaw, 'nightIntervalMinutes', POLLING_DEFAULTS.nightIntervalMinutes),
     nightStartHour: num(pollingRaw, 'nightStartHour', POLLING_DEFAULTS.nightStartHour),
     nightEndHour: num(pollingRaw, 'nightEndHour', POLLING_DEFAULTS.nightEndHour),
+    timeZone: str(pollingRaw, 'timeZone', env('POLLING_TIMEZONE', POLLING_DEFAULTS.timeZone)),
   };
 
   const retryDelays = Array.isArray(downloadRaw['retryDelaysMs'])
@@ -111,9 +113,13 @@ export function loadConfig(options: { requireAccountsFile?: boolean } = {}): App
 
   const sink = env('SINK', 'local') === 'oss' ? 'oss' : 'local';
   const ossPrefix = str(ossRaw, 'prefix', env('OSS_PREFIX', 'douyin-monitor/'));
+  const proxyUrl = env('DTK_PROXY_URL').trim();
 
   if (sink === 'oss' && (!env('OSS_ACCESS_KEY_ID') || !env('OSS_ACCESS_KEY_SECRET'))) {
     throw new Error('SINK=oss 需要 OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET');
+  }
+  if (proxyUrl && !/^(https?|socks5h?):\/\/\S+/i.test(proxyUrl)) {
+    throw new Error('DTK_PROXY_URL 必须是完整 URL，如 http://user:pass@host:port 或 socks5://host:port');
   }
 
   return {
@@ -136,6 +142,7 @@ export function loadConfig(options: { requireAccountsFile?: boolean } = {}): App
       videoIdParam: env('DTK_VIDEO_ID_PARAM', 'aweme_id'),
       syncWait: envInt('DTK_SYNC_WAIT', 25),
       timeoutMs: envInt('DTK_TIMEOUT_MS', 30_000),
+      proxyUrl,
     },
     paths: {
       db: resolveFromRoot(env('DB_PATH', './data/monitor.db')),

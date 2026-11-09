@@ -13,9 +13,9 @@
 | 采集端常驻 | 一个 Node.js 调度器 + Docker 里的 Evil0ctal DTK v5 容器栈 |
 | 云端 | 只消费 OSS 上成对出现的 `.mp4` + `.json`，不直接跟采集器通信 |
 | 不需要 | 屏幕常开浏览器、人工点页面、登录态挂在浏览器里 |
-| 需要 | Docker 常驻、调度器进程、主机不休眠 |
+| 需要 | Docker 常驻、调度器进程（systemd 托管）、机房 IP 场景配住宅代理 |
 
-> **部署平台**：当前 `scripts/setup-runtime.sh`、`deploy/*.plist`、§5 常驻方式为 **macOS + Docker Desktop / launchd** 版；Linux 服务器版（Docker CE + systemd）尚未适配。`src/`、配置与 DTK 接口契约本身平台无关，服务器上可直接 `clone → npm install → npm run serve`。
+> **部署平台**：主形态是 **Linux 服务器 + Docker CE + systemd**——`scripts/setup-runtime.sh` 按 `uname` 自动分流，`deploy/install-service.sh` 安装 systemd unit。macOS 本地调试仍可用 Docker Desktop + `deploy/*.plist`（见 §5 末尾）。`src/`、配置与 DTK 接口契约全部平台无关。
 
 DTK v5 的 README 不列固定路径清单，但本项目已从 **v5.1.7 源码**逐条确认了真实契约（作品列表、单视频、任务状态、鉴权头、cursor 语义），已写进 `.env` 与 `src/config.ts` 默认值。`npm run inspect-openapi` 仍保留，用于实例版本不同时核对——路径与参数依旧全部可配置。
 
@@ -27,7 +27,7 @@ DTK v5 的 README 不列固定路径清单，但本项目已从 **v5.1.7 源码*
 npm install
 npm run demo          # 本地 mock DTK + 假视频，跑两轮验证全链路与去重
 npm run type-check    # tsc --noEmit
-npm test              # 33 个测试（含失败/恢复路径）
+npm test              # 36 个测试（含失败/恢复路径）
 ```
 
 `npm run demo` 会启动 `127.0.0.1:8787` 的 mock 服务，模拟 v5 的 `202 + task_id` 异步模式，产出：
@@ -43,50 +43,41 @@ data/demo/outbox/douyin-monitor/MS4wLjAB/202611/
 
 ## 3. 正式部署
 
-> **从 GitHub clone 到新机器（含 Linux 服务器）时**，仓库不含 `.env` / `accounts.yaml` / `data/`，先做一次初始化：
+> **从 GitHub clone 到新机器（Linux 服务器）时**，仓库不含 `.env` / `accounts.yaml` / `data/`，先初始化：
 >
 > ```bash
-> cp .env.example .env                 # DTK 接口路径已按 v5.1.7 填好，只需补 DTK_API_KEY / OSS_*
+> git clone git@github.com:chengkaii/douyin-monitor.git /opt/douyin-monitor
+> cd /opt/douyin-monitor
+> sudo ./scripts/setup-runtime.sh      # Docker CE + compose plugin + 镜像源 + Node 检查
+> cp .env.example .env                 # DTK 接口路径已按 v5.1.7 填好
 > cp accounts.example.yaml accounts.yaml
-> npm install                          # better-sqlite3 是原生模块，必须在目标机重新编译，别直接拷 node_modules
+> npm install                          # better-sqlite3 是原生模块，必须在目标机重新编译
 > ```
 >
-> 官方 DTK 源码是第三方仓库，未纳入本项目，需单独放到同级 `douyin-api/`（见 §3.1）。远端推荐用 SSH：`git clone git@github.com:chengkaii/douyin-monitor.git`。
+> 官方 DTK 源码是第三方仓库，未纳入本项目：clone 到**与本项目同级**目录（如 `/opt/Douyin_TikTok_Download_API/`），或用 `DTK_REPO=/path/to/repo` 指定。
 
-### 3.1 起 DTK v5 容器栈（首次需你在自己终端操作一次）
+### 3.1 起 DTK v5 容器栈（Linux）
 
-> ⚠️ **平台说明**：以下为 macOS 步骤。Linux 服务器请用 Docker CE + `/etc/docker/daemon.json` 配镜像源，并把 §5 的 launchd 换成 systemd unit（适配待做）。DTK 容器本身与 Node 调度器在 Linux 上运行无差异。
-
-```bash
-./scripts/setup-runtime.sh
-```
-
-脚本会检查 Docker → 下载并安装 Docker Desktop（自动判断 Intel/Apple）→ 拉起 GUI 授权 → 打印镜像源配置。**Docker Desktop → Settings → Docker Engine** 里合并下面这段并 Apply & Restart：
-
-```json
-{
-  "registry-mirrors": [
-    "https://docker.m.daocloud.io",
-    "https://docker.1ms.run",
-    "https://docker.xuanyuan.me",
-    "https://hub.rat.dev"
-  ]
-}
-```
-
-> 不配镜像源会卡在拉镜像：`auth.docker.io` / `registry-1.docker.io` 当前不可达，上面几个镜像站实测可达。
-
-官方 DTK 源码**未纳入本仓库**：把它 clone 到同级 `douyin-api/`，或用 `DTK_REPO=/path/to/repo` 指定；并在该目录生成 `.env`（`DTK_SECRET_KEY` / `POSTGRES_PASSWORD` / `REDIS_PASSWORD` / `DTK_DATABASE_URL` / `DTK_REDIS_URL` / `DTK_IMAGE=evil0ctal/douyin_tiktok_download_api`）。之后三步：
+`setup-runtime.sh` 已装好 Docker CE + compose plugin、合并 `/etc/docker/daemon.json` 的 registry-mirrors、设置 Docker 开机自启。接下来：
 
 ```bash
-npm run dtk:up         # 拉发布镜像 + 起 api/worker/postgres/redis（--no-build）
-npm run dtk:status     # 等全部 healthy
-npm run dtk:bootstrap  # 自动建管理员 → 登录 → 生成 douyin:read 的 API key → 写回 .env
+# 官方源码放到与本项目同级的目录，例如都在 /opt/ 下
+git clone https://github.com/Evil0ctal/Douyin_TikTok_Download_API.git \
+  /opt/Douyin_TikTok_Download_API
+
+npm run dtk:up         # 自动生成官方 .env → 拉发布镜像 → 起栈并等 healthy
+npm run dtk:status     # 复核 api/worker/postgres/redis 全部 healthy
+npm run dtk:bootstrap  # 建管理员 → 登录 → 生成 douyin:read API key → 写回 .env
 ```
 
-`dtk:bootstrap` 全程 HTTP，**不用打开浏览器控制台**；setup token 自动从容器日志提取，也可 `npm run dtk:bootstrap -- --token <token>` 手动指定。管理员凭据存在 `data/dtk-admin.json`（已 gitignore）。
+要点：
 
-**关于 browser profile**：一期默认不启——它要从 GitHub 构建 CloakBrowser，当前网络风险高。改为在 console 手动导入一次登录态 Cookie。要启用自动铸造游客身份：`DTK_BROWSER=1 npm run dtk:up`，并取消 `../douyin-api/.env` 里 `DTK_BROWSER_RPC_URL` 的注释。
+- `dtk:up` 用官方发布镜像（`--no-build`），不本地构建 console；首次会自动生成官方仓库根的 `.env`（权限 600，含随机 `DTK_SECRET_KEY` / DB / Redis 密码），**别提交到任何仓库**。
+- DTK 的 `api` 只绑 `127.0.0.1:8000`，**无需开放防火墙端口**；compose 里各服务都是 `restart: unless-stopped`。
+- `dtk:bootstrap` 全程 HTTP，setup token 自动从容器日志提取，也可 `-- --token <token>` 手动指定；管理员凭据存 `data/dtk-admin.json`（已 gitignore）。
+- Docker Hub 直连不通时，靠 `setup-runtime.sh` 写入的镜像源兜底（daocloud / 1ms / 轩辕 / rat.dev）。
+
+**关于 browser profile**：一期默认不启——它要从 GitHub 构建 CloakBrowser，内网环境风险高。改为在 console 手动导入一次登录态 Cookie。要启用自动铸造游客身份：`DTK_BROWSER=1 npm run dtk:up`，并取消官方仓库 `.env` 里 `DTK_BROWSER_RPC_URL` 的注释。
 
 ### 3.2 接口契约（已按 v5.1.7 源码确认）
 
@@ -121,6 +112,8 @@ npm run dtk:bootstrap  # 自动建管理员 → 登录 → 生成 douyin:read �
 | `OSS_PREFIX` | 对象前缀 | `douyin-monitor/` |
 | `DTK_API_KEY` | console 生成的 key | — |
 | `DTK_SYNC_WAIT` | >0 用 `?wait=N` 同步；0 走 `202 + task_id` 轮询 | `25` |
+| `DTK_PROXY_URL` | 住宅代理完整 URL，**机房 IP 部署必配**，见 §3.5 | 空（直连） |
+| `POLLING_TIMEZONE` | 夜间窗口时区；`accounts.yaml` 的 `polling.timeZone` 优先 | `Asia/Shanghai` |
 | `RETRY_MAX_ATTEMPTS` | 单条视频跨轮最多处理次数（1 次首发 + N 次自动重投） | `5` |
 | `RETRY_FAILED_EVERY_ROUNDS` | `serve` 每 N 轮扫一次 `failed`（15s/轮，20 ≈ 5 分钟） | `20` |
 | `WECOM_WEBHOOK` | 企微机器人告警，留空则只写 `run_log` | 空 |
@@ -138,6 +131,27 @@ npm run serve               # 常驻，每 15s 检查到期账号；每 N 轮顺
 `npm run once` 的其他参数：`--account "账号名"` 只跑某个账号，`--retry-failed` 把未达上限的 failed 重新入队。
 
 `npm run retry-failed` 是手动补投；已耗尽尝试次数的行默认跳过，确认故障已修复后可用 `npm run retry-failed -- --force` 突破上限。`npm run status` 会显示「可自动重投 / 已达上限」的失败条数。
+
+### 3.5 机房 IP 风控：住宅代理（Linux 部署必读）
+
+服务器出口是机房 IP，抖音对作品列表/详情接口的风控明显严于住宅宽带。**正式跑 20+ 账号前必配住宅代理**：
+
+```bash
+# .env
+DTK_PROXY_URL=http://user:pass@proxy.example.com:8080
+```
+
+支持 `http` / `https` / `socks5` / `socks5h` 完整 URL。该值由 Channel 作为 `?proxy=` 传给 DTK 的 `/{platform}/user/posts` 与 `/{platform}/video`，DTK 内部用 `wreq.Proxy` 把「DTK → 抖音」的上游请求换成住宅出口——**不用给容器塞 `HTTP_PROXY`，也不用给 Node 装代理库**。
+
+> DTK 默认 `security.request_proxy=deny`（防 SSRF），带 `?proxy=` 会被直接拒绝。`npm run dtk:bootstrap` 检测到 `DTK_PROXY_URL` 非空时会自动用管理员会话把它设为 `public`（仅允许公网可路由地址，不开 `any`）。若这步失败会打印手动指引，**此时别开跑**，否则每轮轮询都会失败。不用代理时建议在 console 改回 `deny` 收窄攻击面。
+
+三条边界：
+
+- 本机 `Node → 127.0.0.1:8000`、OSS 上传、企微告警**都不走代理**；
+- 视频 CDN 下载直连——静态资源不是风控面，且大文件走住宅代理流量成本极高；
+- 代理凭据会出现在 DTK 的请求 URL 里（DTK 侧日志已脱敏，本项目错误信息只打 pathname），别把容器访问日志外泄。
+
+先按 §8 用 2 账号 / 30 分钟周期试跑 3 天，观察 4xx 与「老账号突然返回合法空列表」的比例；异常先降频或换代理，再考虑切 TikHub 备用通道。
 
 ---
 
@@ -169,7 +183,32 @@ OSS key 规则：`douyin-monitor/{secUserId前8位}/{yyyyMM}/{videoId}.{mp4|json
 
 ## 5. 常驻与自愈
 
-`deploy/com.starpp.douyin-monitor.plist.template` 是 launchd 模板：
+### Linux（systemd，主部署形态）
+
+```bash
+sudo ./deploy/install-service.sh            # 渲染 unit → daemon-reload → enable --now
+systemctl status douyin-monitor
+journalctl -u douyin-monitor -f            # 实时日志
+```
+
+脚本会按 `SUDO_USER` 设运行用户、用 `node` 绝对路径写 `ExecStart`、把 `data/` 属主改给运行用户、将 `.env` 权限收为 600。unit 关键项：`Restart=always` + `RestartSec=10`、`After/Requires=docker.service`、`WantedBy=multi-user.target`；日志走 journald（自带轮转，不再写固定文件）。
+
+容器侧由 compose 的 `restart: unless-stopped` 与 `systemctl enable --now docker` 覆盖，服务器重启后自动恢复。状态全在 SQLite，重启后从断点续传：
+
+| 崩溃点 | 重启后行为 |
+|---|---|
+| 正在下载（`downloading`） | 启动时重置为 `pending`，重新下载；不会永久卡在队列外 |
+| 已下载待上传（`downloaded`） | 下一轮自动重新入队（当前实现会重新下载，见下方边界） |
+| 处理失败（`failed`） | `serve` 每 N 轮自动重投，受 `attempts` 上限约束，坏视频不会无限重试 |
+| 已交付（`uploaded`） | 不再处理 |
+
+> **只允许一个写进程**：systemd 服务运行期间不要手动执行 `once` / `retry-failed`，否则可能重复处理同一条。`status` 只读，随时可查。
+>
+> 已知边界：`downloaded` 补传会重新下载而非复用本地文件（见设计文档 §6），临时文件在失败分支未清理——这两项属于第二批优化。
+
+**时区**：unit 设 `TZ=Asia/Shanghai`；夜间窗口另由 `POLLING_TIMEZONE` / `polling.timeZone` 独立判定（代码用 `Intl.DateTimeFormat` 取小时），云主机默认 UTC 也不会把北京时间 0–6 点错判成白天。
+
+### macOS 本地调试（可选）
 
 ```bash
 mkdir -p data/logs
@@ -179,22 +218,7 @@ sed -e "s|__PROJECT_DIR__|$PWD|g" -e "s|__HOME__|$HOME|g" \
 launchctl load ~/Library/LaunchAgents/com.starpp.douyin-monitor.plist
 ```
 
-> 模板里的 node 路径按 nvm 默认写法，若你用 Homebrew/volta 装 Node，把 `ProgramArguments` 第一项和 `PATH` 改成 `which npm` 的实际结果。
-
-`KeepAlive` 保证崩溃重启，状态全在 SQLite，重启后从断点续传：
-
-| 崩溃点 | 重启后行为 |
-|---|---|
-| 正在下载（`downloading`） | 启动时重置为 `pending`，重新下载；不会永久卡在队列外 |
-| 已下载待上传（`downloaded`） | 下一轮自动重新入队（当前实现会重新下载，见下方边界） |
-| 处理失败（`failed`） | `serve` 每 N 轮自动重投，受 `attempts` 上限约束，坏视频不会无限重试 |
-| 已交付（`uploaded`） | 不再处理 |
-
-> **只允许一个写进程**：`serve` 跑着时不要同时执行 `once` / `retry-failed`，否则可能重复处理同一条。`status` 是只读命令，不触发任务恢复，随时可查。
->
-> 已知边界：`downloaded` 补传会重新下载而非复用本地文件（见设计文档 §6），临时文件在失败分支未清理——这两项属于第二批优化。
-
-**必须防休眠**：`caffeinate -s &` 或「系统设置 → 电池 → 防止自动睡眠」。合盖休眠会直接断采。
+`KeepAlive` / `RunAtLoad` 等价 systemd 的重启与自启；另需 `caffeinate -s &` 防合盖休眠。生产不用这套。
 
 ---
 
@@ -215,14 +239,14 @@ src/
   pipeline.ts        轮询 → 队列 → 状态闭环的全部编排
   cli.ts             once / serve / status / retry-failed
 scripts/
-  dtk.sh             官方 compose 封装（up/pull/status/logs/bootstrap）
-  setup-runtime.sh   首次安装 Docker Desktop + 镜像源指引（需在你自己终端跑）
-  bootstrap.ts       自动初始化管理员 + 生成 API key 写回 .env
+  dtk.sh             官方 compose 封装（up/pull/status/logs/bootstrap，自动生成官方 .env）
+  setup-runtime.sh   双平台运行时准备（Linux: Docker CE + 镜像源 / macOS: Docker Desktop）
+  bootstrap.ts       初始化管理员 + 发 API key + 按需开启 request_proxy，写回 .env
   inspect-openapi.ts 核对实例 OpenAPI 路径
   mock-dtk.ts        本地 mock v5 服务 + 假视频
   demo.ts            一键端到端演练
-test/                33 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约）
-deploy/              launchd 常驻模板（macOS；Linux 版 systemd 待补）
+test/                36 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理）
+deploy/              systemd unit + install-service.sh（Linux）/ launchd plist（macOS）
 docs/                技术实现文档（需求快照、架构、接口契约、风控与里程碑）
 ```
 
@@ -230,7 +254,8 @@ docs/                技术实现文档（需求快照、架构、接口契约�
 
 ## 7. 风控与合规
 
-- 20+ 账号统一周期但**请求间隔 ≥ 8s**（`polling.minGapSeconds`），随机抖动打散规律；夜间周期放宽到 15 分钟
+- 20+ 账号统一周期但**请求间隔 ≥ 8s**（`polling.minGapSeconds`），随机抖动打散规律；夜间（北京时间 0–6 点）周期放宽到 15 分钟
+- **机房 IP 必须配住宅代理**（§3.5）：`DTK_PROXY_URL` 经 DTK `?proxy=` 换上游出口；不配代理直接跑 20+ 账号，大概率触发风控
 - v5 自带自愈身份池、令牌桶、端点熔断；本项目这层只做账号级失败退避（连续失败指数退避，上限 24h）与告警
 - 只拉作品列表首页，不深翻页扫库；单次发现接近整页（≥15 条）才最多补 2 页
 - 采集内容仅用于内部转录/翻译再创作，不二次分发原始视频；账号如有维权声明即从清单移除
@@ -244,11 +269,12 @@ docs/                技术实现文档（需求快照、架构、接口契约�
 |---|---|
 | 代码骨架、SQLite、调度、下载、manifest、OSS/local sink、告警、CLI | ✅ 已实现 |
 | review 第一批修复：崩溃恢复 / 结构不符拒绝假成功 / failed 自动重投封顶 | ✅ 已修复并补回归测试 |
-| 类型检查 `tsc --noEmit` / 32 个测试 / 一键 demo | ✅ 0 错误、全通过 |
+| 类型检查 `tsc --noEmit` / 36 个测试 / 一键 demo | ✅ 0 错误、全通过 |
+| Linux 服务器适配：Docker CE + 镜像源 + systemd + 住宅代理 + 显式时区 | ✅ 已实现（脚本与模板已用模拟数据验证，未在真实服务器跑过） |
 | review 第二批（🟡 限速器竞态、账号目录撞车、补传复用本地文件、告警收敛等） | ⚠️ 未做，按优先级排期 |
 | 切 TikHub 备用通道 | ⚠️ 仅占位（`src/channel/tikhub.ts`），需要时补两个方法 |
-| 真实 DTK 容器联调 | ⚠️ **未做**：本机没有 Docker，`DTK_POSTS_PATH` 等待 `inspect-openapi` 实测填写 |
-| 真实账号 / OSS 凭据 | ⚠️ 未提供，代码用 mock 与 local sink 保证可验证 |
+| 真实 DTK 容器联调 | ⚠️ **未做**：开发机没有 Docker，接口路径虽已按 v5.1.7 源码确认，仍需在服务器上 `inspect-openapi` 复核 |
+| 真实账号 / OSS 凭据 / 住宅代理地址 | ⚠️ 未提供，代码用 mock 与 local sink 保证可验证 |
 | 云端回调通知（二期） | ⚠️ 未做，一期用 ListObjects 即可 |
 
-**上线顺序**：起容器 → `inspect-openapi` 填路径 → 2 个账号 + 30 分钟周期试跑 3 天（对照 App 查漏检）→ 切 `SINK=oss` → 扩到 20+ 账号 + 5 分钟周期 → 装 launchd。
+**上线顺序（Linux 服务器）**：`setup-runtime.sh` → clone 官方源码 → `dtk:up` + `dtk:bootstrap` → 填 `DTK_PROXY_URL` 并重跑 bootstrap 开启 `?proxy=` → 2 个账号 + 30 分钟周期试跑 3 天（对照 App 查漏检、看 4xx 比例）→ 切 `SINK=oss` → 扩到 20+ 账号 + 5 分钟周期 → `install-service.sh` 装 systemd。

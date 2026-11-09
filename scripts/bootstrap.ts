@@ -91,6 +91,46 @@ function tokenFromLogs(): string | undefined {
   }
 }
 
+/**
+ * DTK v5 默认 security.request_proxy=deny，带 ?proxy= 的请求会被直接拒绝。
+ * 机房 IP 部署且配置了住宅代理时，把它开到 public（只允许公网可路由地址，非 any）。
+ * 失败不阻断初始化，但必须给出手动开启指引，否则后续所有轮询都会失败。
+ */
+async function ensureRequestProxy(cookie: string, proxyConfigured: boolean): Promise<void> {
+  const KEY = 'security.request_proxy';
+  try {
+    const list = await call('/api/v1/admin/settings', { headers: { cookie } });
+    if (!list.res.ok) throw new Error(`读取设置 HTTP ${list.res.status}`);
+    const items = asRec(list.body.data)['settings'];
+    const rows = Array.isArray(items) ? items.map(asRec) : [];
+    const current = String(rows.find((r) => r['key'] === KEY)?.['value'] ?? '');
+
+    if (!proxyConfigured) {
+      if (current && current !== 'deny') {
+        console.warn(`⚠️  未配置 DTK_PROXY_URL，但 ${KEY}=${current}；不用代理时建议改回 deny 以收窄 SSRF 面`);
+      }
+      return;
+    }
+    if (current === 'public' || current === 'any') {
+      console.log(`✅ ${KEY} 已为 ${current}`);
+      return;
+    }
+    const put = await call(`/api/v1/admin/settings/${KEY}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify({ value: 'public', confirm: true }),
+    });
+    if (!put.res.ok) throw new Error(`PUT 返回 HTTP ${put.res.status}: ${fail(put.body, '设置失败')}`);
+    console.log(`✅ 已开启 ${KEY}=public（DTK 上游请求可走 ?proxy=，仅允许公网地址）`);
+  } catch (err) {
+    console.warn(`⚠️  无法自动设置 ${KEY}: ${(err as Error).message}`);
+    if (proxyConfigured) {
+      console.warn('   请在 DTK console → Settings 手动把 security.request_proxy 设为 public，');
+      console.warn('   否则带 DTK_PROXY_URL 的采集请求会被 DTK 全部拒绝。');
+    }
+  }
+}
+
 function writeEnv(key: string): void {
   if (!fs.existsSync(ENV_FILE)) {
     throw new Error(`缺少 ${ENV_FILE}；请先 cp .env.example .env`);
@@ -176,6 +216,20 @@ async function main(): Promise<void> {
   if (!login.res.ok) throw new Error(fail(login.body, '登录失败'));
   const cookie = cookieFrom(login.res);
   if (!cookie) throw new Error('登录成功但未拿到 session cookie，无法创建 API key');
+
+  await ensureRequestProxy(cookie, Boolean(process.env['DTK_PROXY_URL']?.trim()));
+
+  // 重跑 bootstrap（例如为了开启 ?proxy=）时不要重复发 key
+  const existingKey = (process.env['DTK_API_KEY'] ?? '').trim();
+  if (existingKey && !existingKey.includes('replace_me')) {
+    try {
+      const probe = await call('/api/v1/system/capabilities', { headers: { 'X-API-Key': existingKey } });
+      if (probe.res.status !== 401) {
+        console.log(`✅ 已有可用 API key，跳过重复创建（鉴权验证 HTTP ${probe.res.status}）`);
+        return;
+      }
+    } catch { /* 探测失败按新建处理 */ }
+  }
 
   const keyResp = await call('/api/v1/admin/api-keys', {
     method: 'POST',

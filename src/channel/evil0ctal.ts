@@ -117,6 +117,11 @@ export class Evil0ctalChannel implements Channel {
       if (v !== '') url.searchParams.set(k, v);
     }
     if (this.cfg.syncWait > 0) url.searchParams.set('wait', String(this.cfg.syncWait));
+    // DTK v5 的 /{platform}/user/posts 与 /{platform}/video 都支持 ?proxy=，
+    // 由 wreq.Proxy 把「DTK → 抖音」的上游请求换成住宅出口。默认 deny，
+    // 需管理员把 security.request_proxy 设为 public（dtk:bootstrap 会自动做）。
+    // 只影响上游，不影响本机 Node → 127.0.0.1:8000 这段。
+    if (this.cfg.proxyUrl) url.searchParams.set('proxy', this.cfg.proxyUrl);
 
     const headers: Record<string, string> = { Accept: 'application/json' };
     // DTK v5 主鉴权头是 X-API-Key（Authorization: Bearer 仅作兼容），两个都发以适配不同版本

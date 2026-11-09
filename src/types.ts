@@ -11,6 +11,8 @@ export interface PollingConfig {
   nightIntervalMinutes: number;
   nightStartHour: number;
   nightEndHour: number;
+  /** 夜间窗口所用时区。服务器常跑 UTC，必须显式指定，否则北京时间 0-6 点会被当白天 */
+  timeZone: string;
 }
 
 export interface DownloadConfig {
@@ -45,6 +47,8 @@ export interface AppConfig {
     videoIdParam: string;
     syncWait: number;
     timeoutMs: number;
+    /** 住宅代理完整 URL；透传给 DTK 的 ?proxy= 参数，让上游请求换出口 IP */
+    proxyUrl: string;
   };
   paths: {
     db: string;

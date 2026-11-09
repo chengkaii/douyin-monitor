@@ -12,6 +12,7 @@ polling:
   nightIntervalMinutes: 15  # 夜间放宽周期
   nightStartHour: 0
   nightEndHour: 6
+  timeZone: Asia/Shanghai  # 夜间窗口按哪个时区判定；Linux 服务器常为 UTC，勿删
 
 download:
   concurrency: 2

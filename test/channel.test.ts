@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Evil0ctalChannel } from '../src/channel/evil0ctal.js';
-import type { AppConfig } from '../src/types.js';
+import type { AppConfig, RawVideo } from '../src/types.js';
 
 /**
  * review #2 回归：HTTP 200 的错误体 / 字段改名 / ID 解析不出来，
@@ -32,6 +32,7 @@ test('DTK 作品列表：结构不符必须报错，合法空列表才算 0 新�
     videoIdParam: 'aweme_id',
     syncWait: 25,
     timeoutMs: 5_000,
+    proxyUrl: '',
   };
   const channel = new Evil0ctalChannel(cfg);
 
@@ -130,6 +131,7 @@ test('DTK v5 契约：首屏省略 cursor、翻页带 cursor、鉴权头齐全',
     videoIdParam: 'aweme_id',
     syncWait: 25,
     timeoutMs: 5_000,
+    proxyUrl: '',
   };
   const channel = new Evil0ctalChannel(cfg);
 
@@ -140,11 +142,71 @@ test('DTK v5 契约：首屏省略 cursor、翻页带 cursor、鉴权头齐全',
     assert.ok(first.url.includes('sec_user_id=MS4wLjABAAAA_TEST'));
     assert.ok(first.url.includes('count=20'));
     assert.ok(first.url.includes('wait=25'));
+    assert.ok(!first.url.includes('proxy='), '未配置代理时不应带 proxy 参数');
     assert.equal(first.headers['x-api-key'], 'dtk_test_key');
     assert.equal(first.headers['authorization'], 'Bearer dtk_test_key');
 
     await channel.listUserVideos('MS4wLjABAAAA_TEST', 'next_cursor_123');
     assert.ok(seen[1]!.url.includes('cursor=next_cursor_123'), '翻页必须带上一页返回的 cursor');
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+});
+
+/**
+ * Linux 机房 IP 部署的风控对策回归：DTK v5 的 /{platform}/user/posts 与
+ * /{platform}/video 都支持 ?proxy=，由 DTK 内部 wreq.Proxy 换住宅出口。
+ * Node → 127.0.0.1:8000 这段不受影响，也不需要给容器塞环境变量。
+ */
+test('DTK_PROXY_URL 在作品列表与单视频详情上都透传为 ?proxy=', async () => {
+  const seen: string[] = [];
+  const server = http.createServer((req, res) => {
+    seen.push(req.url ?? '');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ data: { posts: [], cursor: 0, has_more: false } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const port = (server.address() as AddressInfo).port;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const proxy = 'http://user:pass@proxy.example.com:8080';
+
+  const cfg: AppConfig['dtk'] = {
+    baseUrl,
+    apiKey: 'dtk_test_key',
+    postsPath: '/api/v1/douyin/user/posts',
+    videoPath: '/api/v1/douyin/video',
+    taskPath: '/api/v1/tasks/{taskId}',
+    postsUserParam: 'sec_user_id',
+    postsCursorParam: 'cursor',
+    postsCountParam: 'count',
+    postsCount: 20,
+    videoIdParam: 'aweme_id',
+    syncWait: 25,
+    timeoutMs: 5_000,
+    proxyUrl: proxy,
+  };
+  const channel = new Evil0ctalChannel(cfg);
+  const raw: RawVideo = {
+    videoId: '7450000000000000001',
+    desc: '',
+    createTime: 0,
+    authorNickname: '',
+    authorSignature: '',
+    stats: {},
+    playUrl: '', // 为空才会触发详情请求
+    shareUrl: '',
+    secUserId: 'MS4wLjABAAAA_TEST',
+  };
+
+  try {
+    await channel.listUserVideos('MS4wLjABAAAA_TEST', '0');
+    await channel.resolveVideo(raw);
+    assert.equal(seen.length, 2);
+    for (const url of seen) {
+      assert.equal(new URL(url, baseUrl).searchParams.get('proxy'), proxy);
+    }
   } finally {
     await new Promise<void>((resolve, reject) => {
       server.close((err) => (err ? reject(err) : resolve()));

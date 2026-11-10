@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config as loadDotenv } from 'dotenv';
 import { parse as parseYaml } from 'yaml';
+import { extractSecUid } from './secuid.js';
 import type { AppConfig, DownloadConfig, PollingConfig, RetryConfig } from './types.js';
 
 const ROOT = process.cwd();
@@ -66,11 +67,16 @@ export function loadConfig(options: { requireAccountsFile?: boolean } = {}): App
   const retryRaw = (root['retry'] ?? {}) as Record<string, unknown>;
   const ossRaw = (root['oss'] ?? {}) as Record<string, unknown>;
 
-  const accounts = accountRows.map((a) => ({
-    name: String(a['name'] ?? '未命名账号'),
-    secUserId: String(a['sec_user_id'] ?? ''),
-    enabled: a['enabled'] !== false,
-  })).filter((a) => a.secUserId.length > 0);
+  const accounts = accountRows.map((a) => {
+    // accounts.yaml 里也可以直接粘主页链接或分享文案：同步抠出 /user/ 后的 id。
+    // 短链需要网络，这里不解析；由 npm run add-account 转换，doctor 会提示不合法。
+    const supplied = String(a['sec_user_id'] ?? '').trim();
+    return {
+      name: String(a['name'] ?? '未命名账号'),
+      secUserId: extractSecUid(supplied) ?? supplied,
+      enabled: a['enabled'] !== false,
+    };
+  }).filter((a) => a.secUserId.length > 0);
 
   const num = (obj: Record<string, unknown>, key: string, fallback: number): number => {
     const v = obj[key];

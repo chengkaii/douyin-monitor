@@ -1,5 +1,6 @@
-# 监测账号清单（复制为 accounts.yaml 后填写真实 sec_user_id）
-# sec_user_id 获取：抖音 App → 账号主页 → 分享 → 复制链接 → 浏览器打开后的 /user/MS4wLjABAAAA...
+# 监测账号清单（复制为 accounts.yaml，或直接用 npm run add-account -- "<链接>" 自动录入）
+# 支持纯 sec_user_id / 主页链接 / 短链 / 整段分享文案；短链只跟随 douyin.com 域内的重定向
+# 也可以在本文件里直接粘主页链接，config.ts 会同步抠出 /user/ 后的 id（短链需先经 add-account 转换）
 accounts:
   - name: "示例账号A"
     sec_user_id: "MS4wLjABAAAA_REPLACE_ME"

@@ -12,6 +12,8 @@
     "once": "tsx src/cli.ts once",
     "status": "tsx src/cli.ts status",
     "retry-failed": "tsx src/cli.ts retry-failed",
+    "doctor": "tsx scripts/doctor.ts",
+    "add-account": "tsx scripts/add-account.ts",
     "inspect-openapi": "tsx scripts/inspect-openapi.ts",
     "dtk:bootstrap": "tsx scripts/bootstrap.ts",
     "demo": "tsx scripts/demo.ts",

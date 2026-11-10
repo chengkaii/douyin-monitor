@@ -6,7 +6,7 @@
 - **关联项目**：下游转录/翻译再创作管线（云端）、ffyc-creator OSS
 - **实现代码**：[`README.md`](../README.md)
 
-> 实现状态速览：`tsc --noEmit` 0 错误、52 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**2026-11-10 review 第二批已修**：`downloaded` 补传复用本地文件（sha256 比对，不符回退重下）、失败分支临时 JSON 清理、MP4 落盘 sha256 并写入 manifest、`put` 按 key + 大小幂等、MP4 先传并核对远端大小再写 JSON、补传中断崩溃后回 `downloaded`。**2026-11-10 review 第三批已修**：全局限速器改为预约式（先占位再等待，并发不穿透），列表/翻页/视频详情共用一个实例；OSS 账号目录改用 `sec_user_id` 的 sha256 前 12 位，消除 `MS4wLjABAAAA` 通用前缀撞车；告警按 `scope + 主体 + 归一化错误` 收敛（不同账号各自能报、单窗口封顶 + 汇总），webhook 4xx/5xx 不占窗口名额，`warn` 静默失败也会推企微。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、`run_log` 自动清理策略。
+> 实现状态速览：`tsc --noEmit` 0 错误、77 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**2026-11-10 review 第二批已修**：`downloaded` 补传复用本地文件（sha256 比对，不符回退重下）、失败分支临时 JSON 清理、MP4 落盘 sha256 并写入 manifest、`put` 按 key + 大小幂等、MP4 先传并核对远端大小再写 JSON、补传中断崩溃后回 `downloaded`。**2026-11-10 review 第三批已修**：全局限速器改为预约式（先占位再等待，并发不穿透），列表/翻页/视频详情共用一个实例；OSS 账号目录改用 `sec_user_id` 的 sha256 前 12 位，消除 `MS4wLjABAAAA` 通用前缀撞车；告警按 `scope + 主体 + 归一化错误` 收敛（不同账号各自能报、单窗口封顶 + 汇总），webhook 4xx/5xx 不占窗口名额，`warn` 静默失败也会推企微。**2026-11-10 借鉴同类项目后落地**：新增 `doctor` 自检（先查本地配置、有错即返回，再探 `/readyz` + 鉴权 + 账号可读性；退出码 0/2/3 区分「配错」与「上游坏」），新增 `add-account` 粘链接录账号（纯本地正则 + 短链 `HEAD`，只跟随 `douyin.com` 域；按行写回 yaml，保留注释、去重、清占位），`config.ts` 支持直接粘主页链接；共补 25 个回归测试。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、`run_log` 自动清理策略。
 
 ---
 
@@ -309,7 +309,9 @@ douyin-monitor/
 
 | 操作    | 命令                                            |
 | ----- | --------------------------------------------- |
-| 加/停账号 | 编辑 `accounts.yaml`（enabled 字段），热加载或重启         |
+| 加账号   | `npm run add-account -- "<主页链接 / 分享文案>"` — 自动解析 sec_user_id 并按行写回 yaml |
+| 上线自检 | `npm run doctor` — 配置/上游分流，退出码 0\|2\|3；`--all-accounts` 逐个验号，`--no-probe` 只查本地 |
+| 停账号   | 编辑 `accounts.yaml`（enabled 字段），热加载或重启         |
 | 看状态   | `npm run status` — 各账号最近轮询时间、队列深度、今日新增数       |
 | 补传失败  | `npm run retry-failed`                        |
 | 升级容器  | `docker compose -p dtk -f docker/compose.yml pull && up -d` |
@@ -351,8 +353,10 @@ douyin-monitor/
 ## 附录 A：sec_user_id 获取方法
 
 1. 抖音 App → 目标账号主页 → 右上角分享 → 复制链接
-2. 链接形如 `https://v.douyin.com/xxxxx/`，浏览器打开重定向到 `.../user/MS4wLjABAAAA...`
-3. 路径中 `MS4wLjABAAAA...` 即 `sec_user_id`，填入 `accounts.yaml`
+2. 直接执行 `npm run add-account -- "<复制到的链接或整段分享文案>"`
+3. 工具自动从 `/user/MS4wLjABAAAA...` 抠出 `sec_user_id` 并写入 `accounts.yaml`；短链用 `HEAD` 跟重定向（只跟随 `douyin.com` 域，最多 4 跳），失败时提示改粘浏览器重定向后的主页地址
+4. 也可以把主页链接直接填进 `accounts.yaml`，`config.ts` 会同步归一化；短链必须先用 `add-account` 转换
+5. 录入后先跑 `npm run doctor`，账号不合法 / 上游不可达会在开跑前报出来
 
 ## 附录 B：技术选型清单
 

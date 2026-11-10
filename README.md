@@ -27,7 +27,7 @@ DTK v5 的 README 不列固定路径清单，但本项目已从 **v5.1.7 源码*
 npm install
 npm run demo          # 本地 mock DTK + 假视频，跑两轮验证全链路与去重
 npm run type-check    # tsc --noEmit
-npm test              # 52 个测试（含失败/恢复/补传复用/幂等/限速与告警路径）
+npm test              # 77 个测试（含失败/恢复/补传复用/幂等/限速告警、secuid 解析与 doctor 自检）
 ```
 
 `npm run demo` 会启动 `127.0.0.1:8787` 的 mock 服务，模拟 v5 的 `202 + task_id` 异步模式，产出：
@@ -50,7 +50,7 @@ data/demo/outbox/douyin-monitor/{secUserId 哈希12位}/202611/
 > cd /opt/douyin-monitor
 > sudo ./scripts/setup-runtime.sh      # Docker CE + compose plugin + 镜像源 + Node 检查
 > cp .env.example .env                 # DTK 接口路径已按 v5.1.7 填好
-> cp accounts.example.yaml accounts.yaml
+> cp accounts.example.yaml accounts.yaml   # 也可跳过：npm run add-account 会自动从模板初始化
 > npm install                          # better-sqlite3 是原生模块，必须在目标机重新编译
 > ```
 >
@@ -98,10 +98,17 @@ npm run dtk:bootstrap  # 建管理员 → 登录 → 生成 douyin:read API key 
 
 `.env` 与 `accounts.yaml` 含凭据，**不入库**；从 GitHub clone 的全新环境先按 §3 开头复制模板再编辑：
 
+**账号不用手抠 `sec_user_id`**，粘链接即可：
+
 ```bash
-# 填入每个账号的 sec_user_id（抖音 App → 主页 → 分享 → 复制链接 → 浏览器重定向后的 /user/MS4w...）
-# 试跑期保留 intervalMinutes: 30；确认无漏检后再改 5
+npm run add-account -- "https://www.douyin.com/user/MS4wLjABAAAA..." --name 某某
+npm run add-account -- "长按复制此条消息… https://v.douyin.com/xxxxx/"   # 短链 / 分享文案
+npm run add-account -- "MS4wLjABAAAA..."                                  # 纯 id
 ```
+
+支持纯 `sec_user_id` / 主页链接 / 短链 / 整段分享文案；纯本地正则能命中就不发网络，只有短链才用 `HEAD` 跟重定向（**只跟随 `douyin.com` 域、最多 4 跳**，防 SSRF）。重复 `sec_user_id` 自动跳过，模板里的 `REPLACE_ME` 占位账号自动清除；写回按行编辑，**保留注释与 `polling` / `retry` 等原有配置**。短链解析失败会提示改粘浏览器重定向后的 `/user/` 主页地址。
+
+> 试跑期保留 `intervalMinutes: 30`；确认无漏检后再改 5。
 
 `.env` 里按需设置：
 
@@ -120,13 +127,23 @@ npm run dtk:bootstrap  # 建管理员 → 登录 → 生成 douyin:read API key 
 
 > 这两个 retry 值也可以在 `accounts.yaml` 的 `retry:` 段配置，yaml 优先于 env。
 
-### 3.4 跑起来
+### 3.4 先自检，再跑起来
 
 ```bash
-npm run once -- --force     # 手动跑一轮（--force 忽略轮询到期）
-npm run status              # 查看已见视频数、队列深度、各账号下次轮询、最近日志
-npm run serve               # 常驻，每 15s 检查到期账号；每 N 轮顺带自动重投 failed
+npm run doctor               # 上线前 / 排障第一条命令
+npm run once -- --force      # 手动跑一轮（--force 忽略轮询到期）
+npm run status               # 查看已见视频数、队列深度、各账号下次轮询、最近日志
+npm run serve                # 常驻，每 15s 检查到期账号；每 N 轮顺带自动重投 failed
 ```
+
+`doctor` 把两类问题**彻底分开**：先查本地（Node 版本、`.env` / `accounts.yaml`、API key、接口路径、账号合法性、OSS 凭据、目录可写、时区、告警配置），本地有错就直接返回、不再探测上游；再查 DTK（`/readyz` 可达、`/auth/me` 鉴权与 scope、首个账号能否读出作品）。退出码 **0 通过 / 2 本地配置错误 / 3 上游故障**，便于 CI 或 systemd 直接判定。
+
+```bash
+npm run doctor -- --all-accounts   # 逐个验证所有账号（每个消耗 1 个身份租约）
+npm run doctor -- --no-probe       # 只查本地配置，完全不碰上游
+```
+
+> 老账号返回**合法空列表**时 doctor 给 `warn` 而不是「通过」——这类静默失败常见于登录态过期 / 游客视角，接口本身并不报错。
 
 `npm run once` 的其他参数：`--account "账号名"` 只跑某个账号，`--retry-failed` 把未达上限的 failed 重新入队。
 
@@ -237,8 +254,11 @@ launchctl load ~/Library/LaunchAgents/com.starpp.douyin-monitor.plist
 
 ```
 src/
-  config.ts          配置加载（.env + accounts.yaml）
+  config.ts          配置加载（.env + accounts.yaml，账号 id 同步归一化）
   types.ts           配置与领域类型
+  secuid.ts          纯本地 sec_user_id 解析 + 短链 HEAD（零 DTK scope）
+  account-file.ts    accounts.yaml 按行录入（保留注释、去重、清占位）
+  doctor.ts          自检的纯判断与渲染（本地 / 上游两类检查项）
   normalize.ts       DTK 响应防御式归一化（唯一字段适配层）
   channel/           Channel 抽象 + evil0ctal v5 实现 + TikHub 预留
   store.ts           SQLite（videos / poll_state / run_log）+ 崩溃恢复 + attempts + 本地文件完整性指纹
@@ -253,10 +273,12 @@ scripts/
   dtk.sh             官方 compose 封装（up/pull/status/logs/bootstrap，自动生成官方 .env）
   setup-runtime.sh   双平台运行时准备（Linux: Docker CE + 镜像源 / macOS: Docker Desktop）
   bootstrap.ts       初始化管理员 + 发 API key + 按需开启 request_proxy，写回 .env
+  doctor.ts          自检 CLI：本地配置 / 上游故障分流，退出码 0|2|3
+  add-account.ts     粘链接录账号（纯本地解析 + 短链重定向，按行写回 yaml）
   inspect-openapi.ts 核对实例 OpenAPI 路径
   mock-dtk.ts        本地 mock v5 服务 + 假视频
   demo.ts            一键端到端演练
-test/                52 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理、补传复用/篡改回退/幂等/配对校验、限速竞态/账号目录/告警收敛）
+test/                77 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理、补传复用/篡改回退/幂等/配对校验、限速竞态/账号目录/告警收敛、secuid 解析/账号录入/doctor 分流）
 deploy/              systemd unit + install-service.sh（Linux）/ launchd plist（macOS）
 docs/                技术实现文档（需求快照、架构、接口契约、风控与里程碑）
 ```
@@ -281,10 +303,11 @@ docs/                技术实现文档（需求快照、架构、接口契约�
 |---|---|
 | 代码骨架、SQLite、调度、下载、manifest、OSS/local sink、告警、CLI | ✅ 已实现 |
 | review 第一批修复：崩溃恢复 / 结构不符拒绝假成功 / failed 自动重投封顶 | ✅ 已修复并补回归测试 |
-| 类型检查 `tsc --noEmit` / 52 个测试 / 一键 demo | ✅ 0 错误、全通过 |
+| 类型检查 `tsc --noEmit` / 77 个测试 / 一键 demo | ✅ 0 错误、全通过 |
 | Linux 服务器适配：Docker CE + 镜像源 + systemd + 住宅代理 + 显式时区 | ✅ 已实现（脚本与模板已用模拟数据验证，未在真实服务器跑过） |
 | review 第二批：补传复用本地文件 / 临时文件清理 / sha256 校验 / 上传幂等 / MP4+JSON 配对 | ✅ 已修复并补 7 个回归测试 |
 | review 第三批 🟡：限速器竞态 + 详情请求限速 / 账号目录撞车 / 告警收敛粒度 | ✅ 已修复并补 9 个回归测试 |
+| 借鉴同行：`doctor` 自检（配置/上游分流，退出码 0\|2\|3）、`add-account` 粘链接录账号 | ✅ 已实现并补 25 个回归测试 |
 | `run_log` 自动清理 / 独立日志文件轮转 | ⚠️ 未做（生产走 journald 自带轮转，DB 保留窗口待配） |
 | 切 TikHub 备用通道 | ⚠️ 仅占位（`src/channel/tikhub.ts`），需要时补两个方法 |
 | 真实 DTK 容器联调 | ⚠️ **未做**：开发机没有 Docker，接口路径虽已按 v5.1.7 源码确认，仍需在服务器上 `inspect-openapi` 复核 |

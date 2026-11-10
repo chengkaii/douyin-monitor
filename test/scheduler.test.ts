@@ -71,21 +71,14 @@ test('到期判断与账号筛选', () => {
   assert.deepEqual(dueAccounts(accounts, (id) => states.get(id), now).map((a) => a.name), ['A']);
 });
 
-test('限速器并发调用严格递增放行，不会同时穿透（review 竞态）', async () => {
-  const gap = 25;
-  const limiter = new RateLimiter(gap);
-  const released: number[] = [];
-  await Promise.all([1, 2, 3, 4].map(async () => {
-    await limiter.acquire();
-    released.push(Date.now());
-  }));
-  released.sort((a, b) => a - b);
-  assert.equal(released.length, 4);
-  for (let i = 1; i < released.length; i += 1) {
-    const delta = released[i]! - released[i - 1]!;
-    assert.ok(delta >= gap - 5, `并发调用应串行错峰，实际相邻间隔只有 ${delta}ms`);
-  }
-  assert.ok(limiter.snapshot() > released[0]!, '名额必须在 await 之前预约');
+test('限速器并发调用预约时间严格递增，不会同时穿透（review 竞态）', async () => {
+  // 虚拟时钟不推进：若把「写 lastAt」放在 sleep 之后，并发调用会读到同一个旧值、
+  // 算出同一个 wait（甚至全部为 0）。断言 wait 序列递增即可稳定复现这个竞态。
+  const waits: number[] = [];
+  const limiter = new RateLimiter(100, () => 1_000, async (ms) => { waits.push(ms); });
+  await Promise.all([1, 2, 3, 4].map(() => limiter.acquire()));
+  assert.deepEqual(waits, [100, 200, 300], '第 1 个立即放行，其后每个多排队一个最小间隔');
+  assert.equal(limiter.snapshot(), 1_300, '名额必须在 await 之前预约');
 });
 
 test('限速器长空闲后不堆积等待，时钟回拨也不放大间隔', async () => {

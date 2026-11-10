@@ -16,7 +16,7 @@ export function makeContext(
   if (options.recover !== false) {
     const recovered = store.recoverInterrupted();
     if (recovered > 0) {
-      const message = `恢复 ${recovered} 条中断任务：downloading → pending`;
+      const message = `恢复 ${recovered} 条中断任务：无本地文件的回 pending，已校验的回 downloaded`;
       store.log('warn', 'startup', message);
       console.warn(`[startup] ${message}`);
     }

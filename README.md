@@ -27,7 +27,7 @@ DTK v5 的 README 不列固定路径清单，但本项目已从 **v5.1.7 源码*
 npm install
 npm run demo          # 本地 mock DTK + 假视频，跑两轮验证全链路与去重
 npm run type-check    # tsc --noEmit
-npm test              # 36 个测试（含失败/恢复路径）
+npm test              # 43 个测试（含失败/恢复/补传复用/幂等路径）
 ```
 
 `npm run demo` 会启动 `127.0.0.1:8787` 的 mock 服务，模拟 v5 的 `202 + task_id` 异步模式，产出：
@@ -172,10 +172,14 @@ OSS key 规则：`douyin-monitor/{secUserId前8位}/{yyyyMM}/{videoId}.{mp4|json
   "sourceUrl": "https://www.douyin.com/video/7450000000000000001",
   "videoFile": "7450000000000000001.mp4",
   "videoUrlOss": "https://ffyc-creator.oss-cn-beijing.aliyuncs.com/douyin-monitor/.../7450000000000000001.mp4",
+  "videoSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "videoBytes": 1049088,
   "discoveredAt": 1762400500,
   "uploadedAt": 1762400600
 }
 ```
+
+> `videoSha256` / `videoBytes` 是交付 MP4 的完整性指纹：云端以 JSON 为就绪标记，处理前先核对 MP4 的字节数与哈希，避免拿到半截文件。MP4 先上传并核对远端大小，JSON 才最后落地。
 
 一期建议云端定时 `ListObjects` 扫前缀；二期可加上传成功后的回调通知。
 
@@ -197,14 +201,17 @@ journalctl -u douyin-monitor -f            # 实时日志
 
 | 崩溃点 | 重启后行为 |
 |---|---|
-| 正在下载（`downloading`） | 启动时重置为 `pending`，重新下载；不会永久卡在队列外 |
-| 已下载待上传（`downloaded`） | 下一轮自动重新入队（当前实现会重新下载，见下方边界） |
+| 首次下载中断（`downloading`，无完整性指纹） | 启动时重置为 `pending`，重新下载；不会永久卡在队列外 |
+| 补传中断（`downloading`，已有完整 MP4） | 启动时回到 `downloaded`，下一轮复用本地文件补传 |
+| 已下载待上传（`downloaded`） | 下一轮自动入队；本地文件大小/sha256 与库中记录一致才复用，否则重新下载 |
 | 处理失败（`failed`） | `serve` 每 N 轮自动重投，受 `attempts` 上限约束，坏视频不会无限重试 |
 | 已交付（`uploaded`） | 不再处理 |
 
 > **只允许一个写进程**：systemd 服务运行期间不要手动执行 `once` / `retry-failed`，否则可能重复处理同一条。`status` 只读，随时可查。
 >
-> 已知边界：`downloaded` 补传会重新下载而非复用本地文件（见设计文档 §6），临时文件在失败分支未清理——这两项属于第二批优化。
+> **交付保障**：MP4 落盘即算 sha256 存 SQLite；`downloaded` 补传复用前会重算哈希比对，不符则回退重新下载。上传按 key + 大小幂等；MP4 先传并核对远端大小，JSON 才作为就绪标记落地。任何失败分支都会清掉临时 JSON，完整 MP4 保留给下一轮补传，交付成功后才删除本地文件。
+>
+> 已知边界：`stat` 只比对字节数（OSS `head` 的 ETag 对分片上传不等于 MD5），sha256 由云端消费前自行复核；🟡 限速器竞态、账号目录撞车、告警收敛仍在排期。
 
 **时区**：unit 设 `TZ=Asia/Shanghai`；夜间窗口另由 `POLLING_TIMEZONE` / `polling.timeZone` 独立判定（代码用 `Intl.DateTimeFormat` 取小时），云主机默认 UTC 也不会把北京时间 0–6 点错判成白天。
 
@@ -230,11 +237,11 @@ src/
   types.ts           配置与领域类型
   normalize.ts       DTK 响应防御式归一化（唯一字段适配层）
   channel/           Channel 抽象 + evil0ctal v5 实现 + TikHub 预留
-  store.ts           SQLite（videos / poll_state / run_log）+ 崩溃恢复 + attempts 计数
+  store.ts           SQLite（videos / poll_state / run_log）+ 崩溃恢复 + attempts + 本地文件完整性指纹
   scheduler.ts       错峰、指数退避、夜间放宽、最小间隔限速
-  downloader.ts      流式下载 + 大小/类型校验 + 重试
-  metadata.ts        manifest 生成 + OSS key 规则
-  sink.ts            local（演练）/ oss（正式）
+  downloader.ts      流式下载 + 大小/类型校验 + sha256 + 补传复用 + 重试
+  metadata.ts        manifest 生成（含 sha256/bytes）+ OSS key 规则
+  sink.ts            local（演练）/ oss（正式）+ stat 幂等与配对校验
   notify.ts          run_log + 企微告警收敛
   pipeline.ts        轮询 → 队列 → 状态闭环的全部编排
   cli.ts             once / serve / status / retry-failed
@@ -245,7 +252,7 @@ scripts/
   inspect-openapi.ts 核对实例 OpenAPI 路径
   mock-dtk.ts        本地 mock v5 服务 + 假视频
   demo.ts            一键端到端演练
-test/                36 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理）
+test/                43 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理、补传复用/篡改回退/幂等/配对校验）
 deploy/              systemd unit + install-service.sh（Linux）/ launchd plist（macOS）
 docs/                技术实现文档（需求快照、架构、接口契约、风控与里程碑）
 ```
@@ -269,9 +276,10 @@ docs/                技术实现文档（需求快照、架构、接口契约�
 |---|---|
 | 代码骨架、SQLite、调度、下载、manifest、OSS/local sink、告警、CLI | ✅ 已实现 |
 | review 第一批修复：崩溃恢复 / 结构不符拒绝假成功 / failed 自动重投封顶 | ✅ 已修复并补回归测试 |
-| 类型检查 `tsc --noEmit` / 36 个测试 / 一键 demo | ✅ 0 错误、全通过 |
+| 类型检查 `tsc --noEmit` / 43 个测试 / 一键 demo | ✅ 0 错误、全通过 |
 | Linux 服务器适配：Docker CE + 镜像源 + systemd + 住宅代理 + 显式时区 | ✅ 已实现（脚本与模板已用模拟数据验证，未在真实服务器跑过） |
-| review 第二批（🟡 限速器竞态、账号目录撞车、补传复用本地文件、告警收敛等） | ⚠️ 未做，按优先级排期 |
+| review 第二批：补传复用本地文件 / 临时文件清理 / sha256 校验 / 上传幂等 / MP4+JSON 配对 | ✅ 已修复并补 7 个回归测试 |
+| 其余 🟡 项（限速器竞态、账号目录撞车、告警收敛等） | ⚠️ 未做，按优先级排期 |
 | 切 TikHub 备用通道 | ⚠️ 仅占位（`src/channel/tikhub.ts`），需要时补两个方法 |
 | 真实 DTK 容器联调 | ⚠️ **未做**：开发机没有 Docker，接口路径虽已按 v5.1.7 源码确认，仍需在服务器上 `inspect-openapi` 复核 |
 | 真实账号 / OSS 凭据 / 住宅代理地址 | ⚠️ 未提供，代码用 mock 与 local sink 保证可验证 |

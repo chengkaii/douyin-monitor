@@ -9,8 +9,11 @@ export interface VideoRow {
   desc: string;
   create_time: number;
   status: VideoStatus;
-  local_path: string;
-  oss_key: string;
+  local_path: string | null;
+  /** 本地 MP4 的完整性指纹，供补传复用与云端校验 */
+  local_bytes: number | null;
+  local_sha256: string | null;
+  oss_key: string | null;
   error: string;
   discovered_at: number;
   uploaded_at: number;
@@ -33,6 +36,8 @@ CREATE TABLE IF NOT EXISTS videos (
   create_time   INTEGER,
   status        TEXT NOT NULL DEFAULT 'pending',
   local_path    TEXT,
+  local_bytes   INTEGER,
+  local_sha256  TEXT,
   oss_key       TEXT,
   error         TEXT,
   discovered_at INTEGER NOT NULL,
@@ -69,23 +74,35 @@ export class Store {
     this.db.close();
   }
 
-  /** 老库补列：v1 建表时没有 attempts，直接 ALTER，无需删库重建 */
+  /** 老库补列：v1 建表时没有 attempts / 完整性字段，直接 ALTER，无需删库重建 */
   private migrate(): void {
     const cols = this.db.pragma('table_info(videos)') as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === 'attempts')) {
-      this.db.exec('ALTER TABLE videos ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
-    }
+    const add = (name: string, ddl: string): void => {
+      if (!cols.some((c) => c.name === name)) {
+        this.db.exec(`ALTER TABLE videos ADD COLUMN ${name} ${ddl}`);
+      }
+    };
+    add('attempts', 'INTEGER NOT NULL DEFAULT 0');
+    add('local_bytes', 'INTEGER');
+    add('local_sha256', 'TEXT');
   }
 
   /**
    * 进程在 downloading 阶段被 kill / 断电后，这行永远不会再进队列。
-   * 启动时统一重置为 pending（重新下载即可，不复用可能写了一半的本地文件）。
+   * 首次下载中断（无完整性指纹）→ pending 重新下载；
+   * 补传中断（已有校验过的完整本地文件）→ downloaded，下一轮直接复用文件补传。
    */
   recoverInterrupted(): number {
-    return this.db.prepare(`
-      UPDATE videos SET status = 'pending', local_path = NULL, error = NULL
-      WHERE status = 'downloading'
+    const fresh = this.db.prepare(`
+      UPDATE videos SET status = 'pending', local_path = NULL, local_bytes = NULL,
+        local_sha256 = NULL, error = NULL
+      WHERE status = 'downloading' AND local_bytes IS NULL
     `).run().changes;
+    const complete = this.db.prepare(`
+      UPDATE videos SET status = 'downloaded', error = NULL
+      WHERE status = 'downloading' AND local_bytes IS NOT NULL
+    `).run().changes;
+    return fresh + complete;
   }
 
   /** 每次进入 processVideo 都记一次尝试，用于给 failed 自动重投封顶 */
@@ -126,18 +143,27 @@ export class Store {
     return this.db.prepare('SELECT 1 FROM videos WHERE video_id = ?').get(videoId) !== undefined;
   }
 
-  setStatus(videoId: string, status: VideoStatus, patch: Partial<Pick<VideoRow, 'local_path' | 'oss_key' | 'error' | 'uploaded_at'>> = {}): void {
+  setStatus(
+    videoId: string,
+    status: VideoStatus,
+    patch: Partial<Pick<VideoRow, 'local_path' | 'local_bytes' | 'local_sha256' | 'oss_key' | 'error' | 'uploaded_at'>> = {},
+  ): void {
     const current = this.getVideo(videoId);
     if (!current) return;
+    // 用 hasOwn 区分「没传」和「显式清空」，否则 null 会被 ?? 吞掉
+    const has = (k: string): boolean => Object.prototype.hasOwnProperty.call(patch, k);
     this.db.prepare(`
-      UPDATE videos SET status = ?, local_path = ?, oss_key = ?, error = ?, uploaded_at = ?
+      UPDATE videos SET status = ?, local_path = ?, local_bytes = ?, local_sha256 = ?,
+        oss_key = ?, error = ?, uploaded_at = ?
       WHERE video_id = ?
     `).run(
       status,
-      patch.local_path ?? current.local_path,
-      patch.oss_key ?? current.oss_key,
+      has('local_path') ? patch.local_path : current.local_path,
+      has('local_bytes') ? patch.local_bytes : current.local_bytes,
+      has('local_sha256') ? patch.local_sha256 : current.local_sha256,
+      has('oss_key') ? patch.oss_key : current.oss_key,
       patch.error ?? null,
-      patch.uploaded_at ?? current.uploaded_at,
+      has('uploaded_at') ? patch.uploaded_at : current.uploaded_at,
       videoId,
     );
   }

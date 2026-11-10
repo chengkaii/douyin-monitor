@@ -6,7 +6,7 @@
 - **关联项目**：下游转录/翻译再创作管线（云端）、ffyc-creator OSS
 - **实现代码**：[`README.md`](../README.md)
 
-> 实现状态速览：`tsc --noEmit` 0 错误、36 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、review 第二批 🟡 项。
+> 实现状态速览：`tsc --noEmit` 0 错误、43 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**2026-11-10 review 第二批已修**：`downloaded` 补传复用本地文件（sha256 比对，不符回退重下）、失败分支临时 JSON 清理、MP4 落盘 sha256 并写入 manifest、`put` 按 key + 大小幂等、MP4 先传并核对远端大小再写 JSON、补传中断崩溃后回 `downloaded`。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、其余 🟡 项（限速器竞态、账号目录撞车、告警收敛）。
 
 ---
 
@@ -182,16 +182,18 @@ CREATE TABLE run_log (
   │
   ▼
 4. 逐条 resolveVideo() 拿无水印播放地址 + 文案
+  │   → 补传优先复用本地 MP4（存在 + 字节数/sha256 全匹配），否则重新下载
   │   → 流式下载到 data/tmp/{video_id}.mp4
-  │   → 校验：Content-Type=video/* 且 大小 > 1MB，否则按失败重试
+  │   → 校验：Content-Type=video/* 且 大小 > 1MB，落盘后算 sha256 存进 SQLite
   ▼
-5. 生成 manifest JSON（见 §5）与视频同目录
+5. 生成 manifest JSON（见 §5）与视频同目录，写入 sha256 与字节数
   │
   ▼
-6. 上传 OSS：
+6. 上传 OSS（put 按 key + 大小幂等）：
+  │   先传 .mp4 → stat 核对远端大小 → 再传 .json（就绪标记最后落地）
   │   douyin-monitor/{sec_user_id短}/{yyyyMM}/{video_id}.mp4
   │   douyin-monitor/{sec_user_id短}/{yyyyMM}/{video_id}.json
-  │   成功 → status='uploaded'，删除本地临时文件
+  │   成功 → status='uploaded'，删除本地临时文件；失败保留完整 MP4 供下一轮补传
   ▼
 7. 云端程序按约定消费 OSS 增量（列表 or 事件，见 §5.3）
 ```
@@ -221,12 +223,16 @@ douyin-monitor/
   "createTime": 1762400000,
   "stats": { "digg": 12345, "comment": 234, "share": 56 },
   "videoUrlOss": "https://ffyc-creator.oss-cn-beijing.aliyuncs.com/douyin-monitor/xxxx/202611/7451234567890123456.mp4",
+  "videoFile": "7451234567890123456.mp4",
+  "videoSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "videoBytes": 1049088,
   "discoveredAt": 1762400500,
   "uploadedAt": 1762400600
 }
 ```
 
 > `stats` 为列表接口顺带返回的快照数据，字段名以容器实际返回为准，实施时对齐。
+> `videoSha256` / `videoBytes` 是交付 MP4 的完整性指纹；云端以 JSON 为就绪标记，消费前应先核对对应 MP4 的大小与哈希。
 
 ### 5.3 消费触发方式（分期实施）
 
@@ -243,9 +249,10 @@ douyin-monitor/
 | -------------- | ------------------------------- | ---------------------------------------------------- |
 | 容器签名失效（社区接口变更） | 接口连续 4xx / 任务结果为空     | 调度器标记通道 unhealthy，暂停轮询 + 告警；`docker compose ... pull && up -d` 升级后恢复 |
 | 单账号风控（滑块/空数据）  | 该账号 `fail_streak` 累计            | 指数退避：下次轮询时间 = now + min(间隔 × 2^n, 24h)；连续 24h 失败告警   |
-| 视频下载中断/损坏      | 大小校验、Content-Type 校验、ffprobe 可选 | 重试 3 次（间隔 30s/2m/10m），仍失败置 `failed` 并告警，不阻塞队列        |
-| OSS 上传失败       | SDK 抛错                          | 重试 3 次；本地文件保留不删，下次启动扫 `downloaded` 状态补传              |
-| 服务器重启/进程崩溃   | —                               | systemd `Restart=always` 自动拉起；所有任务状态落 SQLite，重启后从断点恢复  |
+| 视频下载中断/损坏      | 大小/Content-Type 校验 + 落盘 sha256    | 重试 3 次（间隔 30s/2m/10m），仍失败置 `failed` 并告警，不阻塞队列；半成品即删 |
+| 本地文件被篡改/残留    | 补传前重算 sha256 与 SQLite 记录比对      | 不一致则丢弃并重新下载；无完整性指纹的老库行一律不复用                     |
+| OSS 上传失败       | SDK 抛错 / 远端大小不符                    | 保留已校验的完整 MP4、清掉临时 JSON、状态保持 `downloaded`，下一轮直接补传；`put` 按 key + 大小幂等 |
+| 服务器重启/进程崩溃   | —                               | systemd `Restart=always` 自动拉起；无本地文件的 `downloading` 回 `pending`，已有完整 MP4 的回 `downloaded` |
 | 视频发布后列表延迟可见    | 常见现象                            | 无需处理，下次轮询自然补上；5 分钟周期可接受                              |
 
 **风控减压设计**：

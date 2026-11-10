@@ -6,7 +6,15 @@ import type { Manifest, RawVideo } from './types.js';
  */
 export function buildManifest(
   video: RawVideo,
-  args: { discoveredAt: number; uploadedAt: number; videoFile: string; videoUrl?: string },
+  args: {
+    discoveredAt: number;
+    uploadedAt: number;
+    videoFile: string;
+    videoUrl?: string;
+    /** 交付 MP4 的完整性指纹，云端消费前可据此校验文件是否完整 */
+    videoSha256: string;
+    videoBytes: number;
+  },
 ): Manifest {
   return {
     videoId: video.videoId,
@@ -21,6 +29,8 @@ export function buildManifest(
     sourceUrl: video.shareUrl,
     videoFile: args.videoFile,
     videoUrlOss: args.videoUrl ?? '',
+    videoSha256: args.videoSha256,
+    videoBytes: args.videoBytes,
     discoveredAt: args.discoveredAt,
     uploadedAt: args.uploadedAt,
   };

@@ -98,6 +98,42 @@ test('attempts 计数与 listRetryable 上限', () => {
   });
 });
 
+test('崩溃恢复：补传中断（已有完整本地文件）回 downloaded，首次下载中断回 pending', () => {
+  withStore((store) => {
+    store.insertNew([v('1'), v('2')], 1000);
+    store.setStatus('1', 'downloaded', {
+      local_path: '/tmp/1.mp4', local_bytes: 2048, local_sha256: 'a'.repeat(64),
+    });
+    store.setStatus('1', 'downloading'); // 补传到一半被 kill，完整性指纹仍在
+    store.setStatus('2', 'downloading'); // 首次下载中断，没有可用文件
+
+    assert.equal(store.recoverInterrupted(), 2);
+    assert.equal(store.getVideo('1')?.status, 'downloaded');
+    assert.equal(store.getVideo('1')?.local_path, '/tmp/1.mp4');
+    assert.equal(store.getVideo('1')?.local_sha256, 'a'.repeat(64));
+    assert.equal(store.getVideo('2')?.status, 'pending');
+    assert.equal(store.getVideo('2')?.local_path, null);
+    assert.equal(store.getVideo('2')?.local_bytes, null);
+  });
+});
+
+test('setStatus 显式传 null 能清空本地文件指针（不被 ?? 吞掉）', () => {
+  withStore((store) => {
+    store.insertNew([v('1')], 1000);
+    store.setStatus('1', 'downloaded', {
+      local_path: '/tmp/1.mp4', local_bytes: 2048, local_sha256: 'a'.repeat(64),
+    });
+    store.setStatus('1', 'uploaded', {
+      local_path: null, local_bytes: null, local_sha256: null,
+    });
+    const row = store.getVideo('1');
+    assert.equal(row?.status, 'uploaded');
+    assert.equal(row?.local_path, null);
+    assert.equal(row?.local_bytes, null);
+    assert.equal(row?.local_sha256, null);
+  });
+});
+
 test('老库自动补 attempts 列（无需删库重建）', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-monitor-migrate-'));
   const dbPath = path.join(dir, 'legacy.db');

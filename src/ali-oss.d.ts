@@ -12,9 +12,14 @@ declare module 'ali-oss' {
     url: string;
     res: { status: number };
   }
+  interface HeadResult {
+    status: number;
+    meta: Record<string, string>;
+  }
   class OSS {
     constructor(options: OSSOptions);
     put(name: string, file: string): Promise<PutResult>;
+    head(name: string): Promise<HeadResult>;
   }
   export = OSS;
 }

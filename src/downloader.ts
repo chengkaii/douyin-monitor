@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { DownloadConfig } from './types.js';
@@ -10,6 +11,37 @@ export interface DownloadResult {
   filePath: string;
   bytes: number;
   contentType: string;
+  sha256: string;
+}
+
+/** 流式算 sha256，避免把整个 MP4 读进内存 */
+export async function sha256File(filePath: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+export interface LocalFileExpectation {
+  bytes: number | null;
+  sha256: string | null;
+}
+
+/**
+ * 补传时复用本地文件：必须存在、达到最小体积、且与库中记录的字节数/哈希完全一致。
+ * 没有哈希基准（老库遗留行）一律不复用，回退重新下载，避免把来路不明的文件当成交付物。
+ */
+export async function reuseLocalVideo(
+  filePath: string,
+  cfg: DownloadConfig,
+  expected: LocalFileExpectation,
+): Promise<DownloadResult | undefined> {
+  if (!filePath || !expected.sha256 || !fs.existsSync(filePath)) return undefined;
+  const bytes = fs.statSync(filePath).size;
+  if (bytes < cfg.minBytes) return undefined;
+  if (expected.bytes !== null && expected.bytes !== bytes) return undefined;
+  const sha256 = await sha256File(filePath);
+  if (sha256 !== expected.sha256) return undefined;
+  return { filePath, bytes, contentType: 'video/mp4', sha256 };
 }
 
 export function sleep(ms: number): Promise<void> {
@@ -42,7 +74,7 @@ export async function downloadVideo(
     if (bytes < cfg.minBytes) {
       throw new DownloadError(`文件过小 ${bytes}B < ${cfg.minBytes}B，判定为损坏`);
     }
-    return { filePath: target, bytes, contentType };
+    return { filePath: target, bytes, contentType, sha256: await sha256File(target) };
   } catch (err) {
     if (fs.existsSync(target)) fs.rmSync(target, { force: true });
     if (attempt < cfg.maxRetries - 1) {

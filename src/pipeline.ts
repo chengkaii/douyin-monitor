@@ -7,7 +7,7 @@ import type { Store, VideoRow } from './store.js';
 import type { Sink } from './sink.js';
 import type { Notifier } from './notify.js';
 import { dueAccounts, nextPollDelayMs, type RateLimiter } from './scheduler.js';
-import { downloadVideo } from './downloader.js';
+import { downloadVideo, reuseLocalVideo } from './downloader.js';
 import { buildManifest, buildObjectKey } from './metadata.js';
 import { publicUrl } from './sink.js';
 
@@ -101,11 +101,17 @@ export async function pollAccount(
   }
 }
 
-/** 处理单条视频：解析 → 下载 → manifest → 上传 → 状态闭环 */
+/** 处理单条视频：解析 → 下载/复用 → manifest → 上传（MP4 先、JSON 后）→ 状态闭环 */
 export async function processVideo(ctx: PipelineContext, video: RawVideo): Promise<void> {
   const { store, config } = ctx;
+  const prior = store.getVideo(video.videoId);
   store.bumpAttempt(video.videoId);
   store.setStatus(video.videoId, 'downloading');
+
+  let localPath: string | undefined;
+  let jsonPath: string | undefined;
+  let localReady = false; // 本地 MP4 已校验完整，失败时保留供补传
+  let delivered = false;
 
   try {
     const resolved = await ctx.channel.resolveVideo(video);
@@ -113,13 +119,30 @@ export async function processVideo(ctx: PipelineContext, video: RawVideo): Promi
       throw new Error(`未拿到播放地址 (videoId=${video.videoId})，检查 DTK_VIDEO_PATH 配置`);
     }
 
-    const downloaded = await downloadVideo(
+    // 补传优先复用上一轮已校验过的本地文件，避免重复下载整个视频
+    const priorPath = prior?.local_path ?? '';
+    const priorBytes = prior?.local_bytes ?? null;
+    const priorSha = prior?.local_sha256 ?? '';
+    const reused = priorPath && priorSha
+      ? await reuseLocalVideo(priorPath, config.download, {
+          bytes: priorBytes, sha256: priorSha,
+        })
+      : undefined;
+    const downloaded = reused ?? await downloadVideo(
       resolved.playUrl,
       video.videoId,
       config.paths.tmp,
       config.download,
     );
-    store.setStatus(video.videoId, 'downloaded', { local_path: downloaded.filePath, error: '' });
+    if (reused) ctx.notifier.info('pipeline', `${video.videoId} 复用已校验的本地文件，跳过下载`);
+    localPath = downloaded.filePath;
+    store.setStatus(video.videoId, 'downloaded', {
+      local_path: downloaded.filePath,
+      local_bytes: downloaded.bytes,
+      local_sha256: downloaded.sha256,
+      error: '',
+    });
+    localReady = true;
 
     const mp4Key = buildObjectKey(config.ossPrefix, resolved, 'mp4');
     const uploadedAt = ctx.now();
@@ -128,25 +151,61 @@ export async function processVideo(ctx: PipelineContext, video: RawVideo): Promi
       uploadedAt,
       videoFile: `${video.videoId}.mp4`,
       videoUrl: publicUrl(config, mp4Key),
+      videoSha256: downloaded.sha256,
+      videoBytes: downloaded.bytes,
     });
-
-    await ctx.sink.put(mp4Key, downloaded.filePath);
-    const jsonKey = buildObjectKey(config.ossPrefix, resolved, 'json');
-    const jsonPath = path.join(config.paths.tmp, `${video.videoId}.json`);
+    jsonPath = path.join(config.paths.tmp, `${video.videoId}.json`);
     fs.writeFileSync(jsonPath, JSON.stringify(manifest, null, 2), 'utf8');
-    await ctx.sink.put(jsonKey, jsonPath);
 
-    store.setStatus(video.videoId, 'uploaded', { oss_key: mp4Key, uploaded_at: uploadedAt, error: '' });
-    ctx.notifier.info('pipeline', `${video.videoId} 已交付 (${downloaded.bytes} B)`);
-
-    for (const f of [downloaded.filePath, jsonPath]) {
-      if (fs.existsSync(f)) fs.rmSync(f, { force: true });
+    // 顺序即契约：MP4 先落地并核对大小，JSON 作为「就绪标记」最后上传，
+    // 避免云端看到 JSON 却拿到半截 MP4。put 本身按 key + 大小幂等。
+    await ctx.sink.put(mp4Key, downloaded.filePath);
+    if (ctx.sink.stat) {
+      const remote = await ctx.sink.stat(mp4Key);
+      if (!remote || remote.size !== downloaded.bytes) {
+        throw new Error(
+          `MP4 交付校验失败 (${mp4Key}): 远端 ${remote?.size ?? '缺失'}B / 本地 ${downloaded.bytes}B`,
+        );
+      }
     }
+    const jsonKey = buildObjectKey(config.ossPrefix, resolved, 'json');
+    await ctx.sink.put(jsonKey, jsonPath);
+    if (ctx.sink.stat) {
+      const remoteJson = await ctx.sink.stat(jsonKey);
+      if (!remoteJson) throw new Error(`JSON Manifest 交付校验失败 (${jsonKey}): 远端未找到`);
+    }
+
+    store.setStatus(video.videoId, 'uploaded', {
+      oss_key: mp4Key,
+      uploaded_at: uploadedAt,
+      error: '',
+      local_path: null,
+      local_bytes: null,
+      local_sha256: null,
+    });
+    ctx.notifier.info('pipeline', `${video.videoId} 已交付 (${downloaded.bytes} B, sha256 ${downloaded.sha256.slice(0, 12)}…)`);
+    delivered = true;
   } catch (err) {
     const message = (err as Error).message;
-    store.setStatus(video.videoId, 'failed', { error: message });
+    const attempts = store.getVideo(video.videoId)?.attempts ?? 0;
+    // 完整文件还在且未到尝试上限：保持 downloaded，下一轮直接补传（不重新下载、不进 failed 重投）
+    if (localReady && localPath && fs.existsSync(localPath) && attempts < config.retry.maxAttempts) {
+      store.setStatus(video.videoId, 'downloaded', { error: message });
+    } else if (localReady) {
+      store.setStatus(video.videoId, 'failed', { error: message });
+    } else {
+      store.setStatus(video.videoId, 'failed', {
+        error: message, local_path: null, local_bytes: null, local_sha256: null,
+      });
+    }
     await ctx.notifier.error('pipeline', `${video.videoId} 处理失败: ${message}`);
     throw err;
+  } finally {
+    // JSON 每轮重新生成，任何分支都不残留；MP4 只在交付成功后删，失败时留着给补传复用
+    if (jsonPath && fs.existsSync(jsonPath)) fs.rmSync(jsonPath, { force: true });
+    if ((delivered || !localReady) && localPath && fs.existsSync(localPath)) {
+      fs.rmSync(localPath, { force: true });
+    }
   }
 }
 

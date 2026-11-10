@@ -29,6 +29,8 @@ test('manifest 包含下游转录程序需要的全部字段', () => {
     uploadedAt: 1762400600,
     videoFile: '7450000000000000001.mp4',
     videoUrl: 'https://oss.example.com/a.mp4',
+    videoSha256: 'a'.repeat(64),
+    videoBytes: 1024 * 1024 + 512,
   });
   assert.equal(m.videoId, video.videoId);
   assert.equal(m.desc, video.desc);
@@ -38,4 +40,6 @@ test('manifest 包含下游转录程序需要的全部字段', () => {
   assert.equal(m.videoFile, '7450000000000000001.mp4');
   assert.equal(m.videoUrlOss, 'https://oss.example.com/a.mp4');
   assert.equal(m.sourceUrl, video.shareUrl);
+  assert.equal(m.videoSha256, 'a'.repeat(64), 'manifest 必须带 MP4 完整性指纹');
+  assert.equal(m.videoBytes, 1024 * 1024 + 512, 'manifest 必须带 MP4 字节数');
 });

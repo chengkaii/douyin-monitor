@@ -95,6 +95,9 @@ export interface Manifest {
   stats: Record<string, number>;
   sourceUrl: string;
   videoFile: string;
+  /** MP4 的 sha256 / 字节数：云端消费前先校验完整性，避免拿到半截文件 */
+  videoSha256: string;
+  videoBytes: number;
   discoveredAt: number;
   uploadedAt: number;
   [key: string]: unknown;

@@ -114,6 +114,9 @@ export async function processVideo(ctx: PipelineContext, video: RawVideo): Promi
   let delivered = false;
 
   try {
+    // 详情接口和列表接口共用全局限速器：20+ 账号集中出新款时，
+    // 并发的 resolveVideo 也要按 minGapSeconds 排队，不能绕过风控前提。
+    await ctx.limiter.acquire();
     const resolved = await ctx.channel.resolveVideo(video);
     if (!resolved.playUrl.startsWith('http')) {
       throw new Error(`未拿到播放地址 (videoId=${video.videoId})，检查 DTK_VIDEO_PATH 配置`);

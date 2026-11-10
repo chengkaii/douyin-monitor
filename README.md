@@ -27,13 +27,13 @@ DTK v5 的 README 不列固定路径清单，但本项目已从 **v5.1.7 源码*
 npm install
 npm run demo          # 本地 mock DTK + 假视频，跑两轮验证全链路与去重
 npm run type-check    # tsc --noEmit
-npm test              # 43 个测试（含失败/恢复/补传复用/幂等路径）
+npm test              # 52 个测试（含失败/恢复/补传复用/幂等/限速与告警路径）
 ```
 
 `npm run demo` 会启动 `127.0.0.1:8787` 的 mock 服务，模拟 v5 的 `202 + task_id` 异步模式，产出：
 
 ```
-data/demo/outbox/douyin-monitor/MS4wLjAB/202611/
+data/demo/outbox/douyin-monitor/{secUserId 哈希12位}/202611/
   7450000000000000001.mp4 / .json   ...共 3 组
 ```
 
@@ -157,7 +157,9 @@ DTK_PROXY_URL=http://user:pass@proxy.example.com:8080
 
 ## 4. 交付契约（云端消费）
 
-OSS key 规则：`douyin-monitor/{secUserId前8位}/{yyyyMM}/{videoId}.{mp4|json}`
+OSS key 规则：`douyin-monitor/{secUserId 的 sha256 前 12 位}/{yyyyMM}/{videoId}.{mp4|json}`
+
+> 账号目录**不能**截 `sec_user_id` 前 8 位：抖音的 `sec_user_id` 普遍以 `MS4wLjABAAAA` 开头，20+ 账号会全部撞进同一个 `MS4wLjAB/` 目录。哈希保证同一账号稳定映射、不同账号互不干扰。升级后 key 前缀会变，已在 OSS 上的旧对象需按 `videoId` 自行迁移（当前尚未真实联调，无历史对象）。
 
 `.json` manifest 示例：
 
@@ -211,9 +213,11 @@ journalctl -u douyin-monitor -f            # 实时日志
 >
 > **交付保障**：MP4 落盘即算 sha256 存 SQLite；`downloaded` 补传复用前会重算哈希比对，不符则回退重新下载。上传按 key + 大小幂等；MP4 先传并核对远端大小，JSON 才作为就绪标记落地。任何失败分支都会清掉临时 JSON，完整 MP4 保留给下一轮补传，交付成功后才删除本地文件。
 >
-> 已知边界：`stat` 只比对字节数（OSS `head` 的 ETag 对分片上传不等于 MD5），sha256 由云端消费前自行复核；🟡 限速器竞态、账号目录撞车、告警收敛仍在排期。
+> 已知边界：`stat` 只比对字节数（OSS `head` 的 ETag 对分片上传不等于 MD5），sha256 由云端消费前自行复核；`createTime=0` 时年月取当前月份，跨月重试可能换 key；`run_log` 暂无自动清理策略，长期运行需自行配置 SQLite 保留窗口。
 
 **时区**：unit 设 `TZ=Asia/Shanghai`；夜间窗口另由 `POLLING_TIMEZONE` / `polling.timeZone` 独立判定（代码用 `Intl.DateTimeFormat` 取小时），云主机默认 UTC 也不会把北京时间 0–6 点错判成白天。
+
+**告警收敛**：`error` 和 `warn`（含 `poll-empty` 这类静默失败）都会推企微。去重 key = `scope + 主体（账号名 / videoId）+ 归一化错误`，同一账号连续失败 30 分钟内只推一次，但不同账号各自能报出来；每个 scope 单窗口最多 5 条，超出部分在下个窗口汇总成「另有 N 条被收敛」。webhook 返回 4xx/5xx 不占窗口名额，下一条会重试；所有明细始终写 `run_log`。
 
 ### macOS 本地调试（可选）
 
@@ -238,11 +242,11 @@ src/
   normalize.ts       DTK 响应防御式归一化（唯一字段适配层）
   channel/           Channel 抽象 + evil0ctal v5 实现 + TikHub 预留
   store.ts           SQLite（videos / poll_state / run_log）+ 崩溃恢复 + attempts + 本地文件完整性指纹
-  scheduler.ts       错峰、指数退避、夜间放宽、最小间隔限速
+  scheduler.ts       错峰、指数退避、夜间放宽、全局预约式限速（列表 + 详情共用）
   downloader.ts      流式下载 + 大小/类型校验 + sha256 + 补传复用 + 重试
-  metadata.ts        manifest 生成（含 sha256/bytes）+ OSS key 规则
+  metadata.ts        manifest 生成（含 sha256/bytes）+ OSS key 规则（账号目录哈希）
   sink.ts            local（演练）/ oss（正式）+ stat 幂等与配对校验
-  notify.ts          run_log + 企微告警收敛
+  notify.ts          run_log + 企微告警按主体收敛与窗口汇总
   pipeline.ts        轮询 → 队列 → 状态闭环的全部编排
   cli.ts             once / serve / status / retry-failed
 scripts/
@@ -252,7 +256,7 @@ scripts/
   inspect-openapi.ts 核对实例 OpenAPI 路径
   mock-dtk.ts        本地 mock v5 服务 + 假视频
   demo.ts            一键端到端演练
-test/                43 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理、补传复用/篡改回退/幂等/配对校验）
+test/                52 个测试（同步/异步 E2E + 崩溃恢复、结构不符、重投上限、v5 契约、时区/代理、补传复用/篡改回退/幂等/配对校验、限速竞态/账号目录/告警收敛）
 deploy/              systemd unit + install-service.sh（Linux）/ launchd plist（macOS）
 docs/                技术实现文档（需求快照、架构、接口契约、风控与里程碑）
 ```
@@ -261,7 +265,8 @@ docs/                技术实现文档（需求快照、架构、接口契约�
 
 ## 7. 风控与合规
 
-- 20+ 账号统一周期但**请求间隔 ≥ 8s**（`polling.minGapSeconds`），随机抖动打散规律；夜间（北京时间 0–6 点）周期放宽到 15 分钟
+- 20+ 账号统一周期但**所有 DTK 请求间隔 ≥ 8s**（`polling.minGapSeconds`）：作品列表、翻页、每条视频详情共用一个预约式限速器，并发调用先占位再等待，不会同时穿透；随机抖动打散规律，夜间（北京时间 0–6 点）周期放宽到 15 分钟
+- **账号数与间隔要配套**：20 个账号 × 8s ≈ 160s，再加上新视频详情请求，若一轮跑不满 5 分钟周期，请调大 `intervalMinutes`（或试跑期调小 `minGapSeconds`），避免请求持续积压
 - **机房 IP 必须配住宅代理**（§3.5）：`DTK_PROXY_URL` 经 DTK `?proxy=` 换上游出口；不配代理直接跑 20+ 账号，大概率触发风控
 - v5 自带自愈身份池、令牌桶、端点熔断；本项目这层只做账号级失败退避（连续失败指数退避，上限 24h）与告警
 - 只拉作品列表首页，不深翻页扫库；单次发现接近整页（≥15 条）才最多补 2 页
@@ -276,10 +281,11 @@ docs/                技术实现文档（需求快照、架构、接口契约�
 |---|---|
 | 代码骨架、SQLite、调度、下载、manifest、OSS/local sink、告警、CLI | ✅ 已实现 |
 | review 第一批修复：崩溃恢复 / 结构不符拒绝假成功 / failed 自动重投封顶 | ✅ 已修复并补回归测试 |
-| 类型检查 `tsc --noEmit` / 43 个测试 / 一键 demo | ✅ 0 错误、全通过 |
+| 类型检查 `tsc --noEmit` / 52 个测试 / 一键 demo | ✅ 0 错误、全通过 |
 | Linux 服务器适配：Docker CE + 镜像源 + systemd + 住宅代理 + 显式时区 | ✅ 已实现（脚本与模板已用模拟数据验证，未在真实服务器跑过） |
 | review 第二批：补传复用本地文件 / 临时文件清理 / sha256 校验 / 上传幂等 / MP4+JSON 配对 | ✅ 已修复并补 7 个回归测试 |
-| 其余 🟡 项（限速器竞态、账号目录撞车、告警收敛等） | ⚠️ 未做，按优先级排期 |
+| review 第三批 🟡：限速器竞态 + 详情请求限速 / 账号目录撞车 / 告警收敛粒度 | ✅ 已修复并补 9 个回归测试 |
+| `run_log` 自动清理 / 独立日志文件轮转 | ⚠️ 未做（生产走 journald 自带轮转，DB 保留窗口待配） |
 | 切 TikHub 备用通道 | ⚠️ 仅占位（`src/channel/tikhub.ts`），需要时补两个方法 |
 | 真实 DTK 容器联调 | ⚠️ **未做**：开发机没有 Docker，接口路径虽已按 v5.1.7 源码确认，仍需在服务器上 `inspect-openapi` 复核 |
 | 真实账号 / OSS 凭据 / 住宅代理地址 | ⚠️ 未提供，代码用 mock 与 local sink 保证可验证 |

@@ -49,21 +49,38 @@ export function isDue(state: PollStateRow | undefined, now = Date.now()): boolea
   return state === undefined || state.next_poll_at <= now;
 }
 
-/** 全局最小间隔限速器：20+ 账号错峰串行，避免整齐划一的请求模式 */
+/**
+ * 全局最小间隔限速器：所有 DTK 请求（列表 + 视频详情）共用一个实例，串行错峰。
+ * 采用「先预约、后 sleep」：并发调用会拿到递增的放行时间，不会同时穿透。
+ */
 export class RateLimiter {
-  private lastAt = 0;
+  private nextAt = 0;
+  private lastNow = 0;
 
-  constructor(private readonly minGapMs: number) {}
+  constructor(
+    private readonly minGapMs: number,
+    /** 仅测试注入，避免真的 sleep；生产用默认实现 */
+    private readonly clock: () => number = Date.now,
+    private readonly sleep: (ms: number) => Promise<void> =
+      (ms) => new Promise((r) => setTimeout(r, ms)),
+  ) {}
 
   async acquire(): Promise<void> {
-    const wait = this.lastAt + this.minGapMs - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    this.lastAt = Date.now();
+    const now = this.clock();
+    // 系统时钟回拨（NTP 校时）时丢弃落在未来的预约点，否则会白等一大段
+    if (now < this.lastNow) this.nextAt = now;
+    this.lastNow = now;
+    // 关键：在 await 之前就把名额占掉。若在 sleep 之后才写 lastAt，
+    // 并发调用会读到同一个旧值、算出同一个 wait，一起放行。
+    const scheduledAt = Math.max(now, this.nextAt + this.minGapMs);
+    this.nextAt = scheduledAt;
+    const wait = scheduledAt - now;
+    if (wait > 0) await this.sleep(wait);
   }
 
-  /** 测试用：注入时钟，避免真的 sleep */
+  /** 测试用：下一次可预约的时间戳 */
   snapshot(): number {
-    return this.lastAt;
+    return this.nextAt;
   }
 }
 

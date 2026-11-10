@@ -6,7 +6,7 @@
 - **关联项目**：下游转录/翻译再创作管线（云端）、ffyc-creator OSS
 - **实现代码**：[`README.md`](../README.md)
 
-> 实现状态速览：`tsc --noEmit` 0 错误、43 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**2026-11-10 review 第二批已修**：`downloaded` 补传复用本地文件（sha256 比对，不符回退重下）、失败分支临时 JSON 清理、MP4 落盘 sha256 并写入 manifest、`put` 按 key + 大小幂等、MP4 先传并核对远端大小再写 JSON、补传中断崩溃后回 `downloaded`。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、其余 🟡 项（限速器竞态、账号目录撞车、告警收敛）。
+> 实现状态速览：`tsc --noEmit` 0 错误、52 个测试全通过、`npm run demo` 端到端通过（同步 + v5 异步两种链路）。已实现 M1–M4 的调度器侧：Channel 抽象、SQLite 增量、错峰/退避、下载校验、manifest、local/oss sink、告警、CLI、systemd 与 launchd 双平台常驻模板。**2026-11-06 code review 第一批已修**：① 启动时把遗留 `downloading` 恢复为 `pending`；② 作品列表结构不符（错误体/字段改名/ID 解析不出）抛 `ChannelError` 进入退避告警，不再假成功；③ `failed` 在 `serve` 中按 `retry.everyRounds` 自动重投，用 `attempts` 列封顶（`retry.maxAttempts`）。**2026-11-09 Linux 适配**：`setup-runtime.sh` 双平台（Docker CE/Desktop）、systemd unit + 安装脚本、`DTK_PROXY_URL` 经 DTK `?proxy=` 换住宅出口、`POLLING_TIMEZONE` 显式时区避免 UTC 服务器夜间窗口错判。**2026-11-10 review 第二批已修**：`downloaded` 补传复用本地文件（sha256 比对，不符回退重下）、失败分支临时 JSON 清理、MP4 落盘 sha256 并写入 manifest、`put` 按 key + 大小幂等、MP4 先传并核对远端大小再写 JSON、补传中断崩溃后回 `downloaded`。**2026-11-10 review 第三批已修**：全局限速器改为预约式（先占位再等待，并发不穿透），列表/翻页/视频详情共用一个实例；OSS 账号目录改用 `sec_user_id` 的 sha256 前 12 位，消除 `MS4wLjABAAAA` 通用前缀撞车；告警按 `scope + 主体 + 归一化错误` 收敛（不同账号各自能报、单窗口封顶 + 汇总），webhook 4xx/5xx 不占窗口名额，`warn` 静默失败也会推企微。**未完成**：真实 DTK 容器联调、真实账号与 OSS 凭据未提供、云端回调（二期）、`run_log` 自动清理策略。
 
 ---
 
@@ -191,8 +191,8 @@ CREATE TABLE run_log (
   ▼
 6. 上传 OSS（put 按 key + 大小幂等）：
   │   先传 .mp4 → stat 核对远端大小 → 再传 .json（就绪标记最后落地）
-  │   douyin-monitor/{sec_user_id短}/{yyyyMM}/{video_id}.mp4
-  │   douyin-monitor/{sec_user_id短}/{yyyyMM}/{video_id}.json
+  │   douyin-monitor/{secUserId 哈希12位}/{yyyyMM}/{video_id}.mp4
+  │   douyin-monitor/{secUserId 哈希12位}/{yyyyMM}/{video_id}.json
   │   成功 → status='uploaded'，删除本地临时文件；失败保留完整 MP4 供下一轮补传
   ▼
 7. 云端程序按约定消费 OSS 增量（列表 or 事件，见 §5.3）
@@ -206,11 +206,13 @@ CREATE TABLE run_log (
 
 ```
 douyin-monitor/
-  └── {secUserId前8位}/
+  └── {secUserId 的 sha256 前 12 位}/
       └── 202611/
           ├── 7451234567890123456.mp4     # 无水印视频本体
           └── 7451234567890123456.json    # 该视频的 manifest
 ```
+
+> 不能截 `sec_user_id` 前 8 位当目录：抖音 `sec_user_id` 普遍以 `MS4wLjABAAAA` 开头，20+ 账号会全部撞进 `MS4wLjAB/`。哈希保证同一账号稳定映射、不同账号不撞车。
 
 ### 5.2 manifest JSON Schema
 
@@ -257,7 +259,7 @@ douyin-monitor/
 
 **风控减压设计**：
 
-- 20+ 账号统一周期但请求间隔 ≥ 8s（单轮询周期内串行+错峰 jitter），折合单容器 QPS < 0.15；
+- 20+ 账号统一周期但**所有 DTK 请求间隔 ≥ 8s**（`polling.minGapSeconds`）：作品列表、翻页、每条视频详情共用一个预约式限速器，并发调用先占位再等待，不会同时穿透；错峰 jitter 打散规律，折合单容器 QPS < 0.15；账号数 × 8s 若逼近轮询周期，应调大 `intervalMinutes`
 - **机房 IP 必须用住宅代理兜住**：`DTK_PROXY_URL` 经 DTK 的 `?proxy=` 把上游请求换成住宅出口；DTK 默认 `security.request_proxy=deny`，`dtk:bootstrap` 在配置代理时自动开到 `public`（只允许公网可路由地址，不开 `any`）。不用代理时应在 console 改回 `deny` 收窄 SSRF 面；
 - 只拉列表首页，不做深翻页扫库；
 - 夜间（北京时间 0:00–6:00）轮询周期放宽到 15 分钟，进一步降低行为规律性；时区由 `POLLING_TIMEZONE` / `polling.timeZone` 显式指定，不依赖服务器本地时区（多数云主机为 UTC）；
@@ -300,7 +302,8 @@ douyin-monitor/
 ### 7.2 告警通道（notify.ts）
 
 - 最小实现：失败事件写入 `run_log` + 发送 Server酱/企业微信机器人 webhook（文本消息即可）
-- 告警收敛：同类错误 30 分钟内只报一次，附 `fail_streak` 计数
+- 告警收敛：去重 key = `scope + 主体（账号名 / videoId）+ 归一化错误`，同类错误 30 分钟内只报一次，但不同账号各自能报出来；每个 scope 单窗口封顶 5 条，超出部分在下个窗口汇总「另有 N 条被收敛」
+- `warn` 的静默失败信号（登录态失效、老账号突然空列表）同样推企微；webhook 返回 4xx/5xx 不占窗口名额，会随下一条重试；所有明细始终写 `run_log`
 
 ### 7.3 日常操作
 

@@ -7,6 +7,7 @@ import { startMockDtk } from '../scripts/mock-dtk.js';
 import { makeContext } from '../src/context.js';
 import { runOnce, runForever, pollAccount } from '../src/pipeline.js';
 import { ChannelError } from '../src/channel/types.js';
+import { RateLimiter } from '../src/scheduler.js';
 import type { RawVideo } from '../src/types.js';
 
 function listFiles(dir: string, prefix = ''): string[] {
@@ -109,6 +110,33 @@ test('端到端（v5 异步 202 + task_id 模式）同样跑通', async () => {
       assert.equal(result.discovered, 3);
       assert.equal(result.uploaded, 3);
       assert.equal(listFiles(path.join(dir, 'outbox')).length, 6);
+    } finally {
+      ctx.store.close();
+    }
+  } finally {
+    await mock.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('所有 DTK 请求（列表 + 每条视频详情）都过全局限速器', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'douyin-monitor-limiter-'));
+  const mock = await startMockDtk(0);
+  try {
+    setEnv(mock.url, dir, '25');
+    const ctx = makeContext();
+    const limiter = new RateLimiter(0); // 测试不真的等待，只数预约次数
+    const originalAcquire = limiter.acquire.bind(limiter);
+    let calls = 0;
+    limiter.acquire = async () => {
+      calls += 1;
+      await originalAcquire();
+    };
+    ctx.limiter = limiter;
+    try {
+      const summary = await runOnce(ctx, { force: true });
+      assert.equal(summary.uploaded, 3);
+      assert.equal(calls, 4, '1 次作品列表 + 3 次视频详情，详情不能绕过限速');
     } finally {
       ctx.store.close();
     }
